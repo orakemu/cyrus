@@ -9,8 +9,45 @@
 			"linearToken": "your-linear-oauth-token-1",
 			"workspaceBaseDir": "/path/to/workspaces/repo1",
 			"isActive": true,
+			"runner": "codex",
+			"runnerModels": {
+				"codex": { "model": "o3-mini" },
+				"claude": {
+					"model": "claude-3.7-sonnet",
+					"fallbackModel": "claude-3.5-sonnet"
+				}
+			},
+			"classifierOverride": { "runner": "codex", "model": "o3-mini" },
+			"procedureOverrides": {
+				"orchestrator-full": {
+					"runner": "claude",
+					"model": "claude-3.7-sonnet"
+				},
+				"debugger-full": { "runner": "claude", "model": "claude-3.7-sonnet" }
+			},
+			"labelAgentRouting": [
+				{ "labels": ["Bug"], "runner": "claude", "model": "claude-3.7-sonnet" },
+				{ "labels": ["Hotfix"], "runner": "codex", "model": "o3-mini" }
+			],
+			"labelPrompts": {
+				"debugger": { "labels": ["Bug"], "allowedTools": "readOnly" },
+				"builder": {
+					"labels": ["Feature", "Improvement"],
+					"allowedTools": "safe"
+				},
+				"scoper": {
+					"labels": ["PRD"],
+					"allowedTools": ["Read(**)", "WebFetch", "mcp__linear"]
+				},
+				"orchestrator": {
+					"labels": ["Orchestrator"],
+					"allowedTools": "coordinator"
+				}
+			},
 			"promptTemplatePath": "./agent-prompt-template.md",
-			"mcpConfigPath": "./mcp-config.json"
+			"mcpConfigPath": "./mcp-config.json",
+			"openaiApiKey": "your-openai-api-key",
+			"openaiOutputDirectory": "/path/to/save/videos"
 		},
 		{
 			"id": "repo2",
@@ -21,6 +58,16 @@
 			"linearToken": "your-linear-oauth-token-2",
 			"workspaceBaseDir": "/path/to/workspaces/repo2",
 			"isActive": true,
+			"runner": "claude",
+			"runnerModels": {
+				"claude": {
+					"model": "claude-3.7-haiku",
+					"fallbackModel": "claude-3.5-sonnet"
+				}
+			},
+			"labelAgentRouting": [
+				{ "labels": ["Docs"], "runner": "claude", "model": "claude-3.7-sonnet" }
+			],
 			"promptTemplatePath": "./custom-prompt.md"
 		}
 	]

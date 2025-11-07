@@ -27,7 +27,8 @@
 			"cyrus-edge-worker": ["packages/edge-worker/src/index.ts"],
 			"cyrus-claude-runner": ["packages/claude-runner/src/index.ts"],
 			"cyrus-ndjson-client": ["packages/ndjson-client/src/index.ts"],
-			"cyrus-agent-runner": ["packages/agent-runner/src/index.ts"]
+			"cyrus-agent-runner": ["packages/agent-runner/src/index.ts"],
+			"cyrus-simple-agent-runner": ["packages/simple-agent-runner/src/index.ts"]
 		}
 	},
 	"exclude": ["node_modules", "dist", "build"]

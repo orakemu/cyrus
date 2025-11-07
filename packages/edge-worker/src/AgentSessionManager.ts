@@ -17,6 +17,8 @@ import type {
 	SerializedCyrusAgentSessionEntry,
 	Workspace,
 } from "cyrus-core";
+import type { ProcedureRouter } from "./procedures/ProcedureRouter.js";
+import type { SharedApplicationServer } from "./SharedApplicationServer.js";
 
 /**
  * Manages Linear Agent Sessions integration with Claude Code SDK
@@ -30,11 +32,18 @@ export class AgentSessionManager {
 	private sessions: Map<string, CyrusAgentSession> = new Map();
 	private entries: Map<string, CyrusAgentSessionEntry[]> = new Map(); // Stores a list of session entries per each session by its linearAgentActivitySessionId
 	private activeTasksBySession: Map<string, string> = new Map(); // Maps session ID to active Task tool use ID
+	private toolCallsByToolUseId: Map<string, { name: string; input: any }> =
+		new Map(); // Track tool calls by their tool_use_id
+	private procedureRouter?: ProcedureRouter;
+	private sharedApplicationServer?: SharedApplicationServer;
 	private getParentSessionId?: (childSessionId: string) => string | undefined;
 	private resumeParentSession?: (
 		parentSessionId: string,
 		prompt: string,
 		childSessionId: string,
+	) => Promise<void>;
+	private resumeNextSubroutine?: (
+		linearAgentActivitySessionId: string,
 	) => Promise<void>;
 
 	constructor(
@@ -45,10 +54,18 @@ export class AgentSessionManager {
 			prompt: string,
 			childSessionId: string,
 		) => Promise<void>,
+		resumeNextSubroutine?: (
+			linearAgentActivitySessionId: string,
+		) => Promise<void>,
+		procedureRouter?: ProcedureRouter,
+		sharedApplicationServer?: SharedApplicationServer,
 	) {
 		this.linearClient = linearClient;
 		this.getParentSessionId = getParentSessionId;
 		this.resumeParentSession = resumeParentSession;
+		this.resumeNextSubroutine = resumeNextSubroutine;
+		this.procedureRouter = procedureRouter;
+		this.sharedApplicationServer = sharedApplicationServer;
 	}
 
 	/**
@@ -101,6 +118,7 @@ export class AgentSessionManager {
 		linearSession.claudeSessionId = claudeSystemMessage.session_id;
 		linearSession.updatedAt = Date.now();
 		linearSession.metadata = {
+			...linearSession.metadata, // Preserve existing metadata
 			model: claudeSystemMessage.model,
 			tools: claudeSystemMessage.tools,
 			permissionMode: claudeSystemMessage.permissionMode,
@@ -118,9 +136,11 @@ export class AgentSessionManager {
 		// Extract tool info if this is an assistant message
 		const toolInfo =
 			sdkMessage.type === "assistant" ? this.extractToolInfo(sdkMessage) : null;
-		// Extract tool_use_id if this is a user message with tool_result
-		const toolResultId =
-			sdkMessage.type === "user" ? this.extractToolResultId(sdkMessage) : null;
+		// Extract tool_use_id and error status if this is a user message with tool_result
+		const toolResultInfo =
+			sdkMessage.type === "user"
+				? this.extractToolResultInfo(sdkMessage)
+				: null;
 
 		const sessionEntry: CyrusAgentSessionEntry = {
 			claudeSessionId: sdkMessage.session_id,
@@ -134,8 +154,9 @@ export class AgentSessionManager {
 					toolName: toolInfo.name,
 					toolInput: toolInfo.input,
 				}),
-				...(toolResultId && {
-					toolUseId: toolResultId,
+				...(toolResultInfo && {
+					toolUseId: toolResultInfo.toolUseId,
+					toolResultError: toolResultInfo.isError,
 				}),
 			},
 		};
@@ -208,6 +229,10 @@ export class AgentSessionManager {
 		// Clear any active Task when session completes
 		this.activeTasksBySession.delete(linearAgentActivitySessionId);
 
+		// Clear tool calls tracking for this session
+		// Note: We should ideally track by session, but for now clearing all is safer
+		// to prevent memory leaks
+
 		const status =
 			resultMessage.subtype === "success"
 				? LinearDocument.AgentSessionStatus.Complete
@@ -219,47 +244,250 @@ export class AgentSessionManager {
 			usage: resultMessage.usage,
 		});
 
-		// Always add result entry so Linear reflects the final state
-		await this.addResultEntry(linearAgentActivitySessionId, resultMessage);
+		// If procedure router is unavailable, fall back to legacy posting behavior
+		if (!this.procedureRouter) {
+			await this.handleResultWithoutProcedure(
+				linearAgentActivitySessionId,
+				resultMessage,
+			);
+			return;
+		}
 
-		// Check if this is a child session and send result to parent when we have a textual result
-		if (
-			"result" in resultMessage &&
-			typeof resultMessage.result === "string" &&
-			resultMessage.result.trim().length > 0
-		) {
-			if (this.getParentSessionId && this.resumeParentSession) {
-				const parentAgentSessionId = this.getParentSessionId(
-					linearAgentActivitySessionId,
+		// Handle result using procedure routing system
+		if ("result" in resultMessage && resultMessage.result) {
+			await this.handleProcedureCompletion(
+				session,
+				linearAgentActivitySessionId,
+				resultMessage,
+			);
+		}
+	}
+
+	/**
+	 * Handle completion using procedure routing system
+	 */
+	private async handleProcedureCompletion(
+		session: CyrusAgentSession,
+		linearAgentActivitySessionId: string,
+		resultMessage: SDKResultMessage,
+	): Promise<void> {
+		if (!this.procedureRouter) {
+			throw new Error("ProcedureRouter not available");
+		}
+
+		// Check if error occurred
+		if (resultMessage.subtype !== "success") {
+			console.log(
+				`[AgentSessionManager] Subroutine completed with error, not triggering next subroutine`,
+			);
+			return;
+		}
+
+		const claudeSessionId = session.claudeSessionId;
+		if (!claudeSessionId) {
+			console.error(
+				`[AgentSessionManager] No Claude session ID found for procedure session`,
+			);
+			return;
+		}
+
+		// Check if there's a next subroutine
+		const nextSubroutine = this.procedureRouter.getNextSubroutine(session);
+
+		if (nextSubroutine) {
+			// More subroutines to run - check if current subroutine requires approval
+			const currentSubroutine =
+				this.procedureRouter.getCurrentSubroutine(session);
+
+			if (currentSubroutine?.requiresApproval) {
+				console.log(
+					`[AgentSessionManager] Current subroutine "${currentSubroutine.name}" requires approval before proceeding`,
 				);
-				if (parentAgentSessionId) {
-					console.log(
-						`[AgentSessionManager] Session ${linearAgentActivitySessionId} is a child of ${parentAgentSessionId}, sending result to parent`,
+
+				// Check if SharedApplicationServer is available
+				if (!this.sharedApplicationServer) {
+					console.error(
+						`[AgentSessionManager] SharedApplicationServer not available for approval workflow`,
+					);
+					await this.createErrorActivity(
+						linearAgentActivitySessionId,
+						"Approval workflow failed: Server not available",
+					);
+					return;
+				}
+
+				// Extract the final result from the completed subroutine
+				const subroutineResult =
+					"result" in resultMessage && resultMessage.result
+						? resultMessage.result
+						: "No result available";
+
+				try {
+					// Register approval request with server
+					const approvalRequest =
+						this.sharedApplicationServer.registerApprovalRequest(
+							linearAgentActivitySessionId,
+						);
+
+					// Post approval elicitation to Linear with auth signal URL
+					const approvalMessage = `The previous step has completed. Please review the result below and approve to continue:\n\n${subroutineResult}`;
+
+					await this.createApprovalElicitation(
+						linearAgentActivitySessionId,
+						approvalMessage,
+						approvalRequest.url,
 					);
 
-					// Resume parent session with child result
-					try {
-						const childResult = resultMessage.result;
-						const promptToParent = `Child agent session, with ID ${linearAgentActivitySessionId} completed with result:\n\n${childResult}`;
+					console.log(
+						`[AgentSessionManager] Waiting for approval at URL: ${approvalRequest.url}`,
+					);
 
-						// Use the resumeParentSession callback to handle the parent session
-						await this.resumeParentSession(
-							parentAgentSessionId,
-							promptToParent,
-							linearAgentActivitySessionId, // Pass child session ID
-						);
+					// Wait for approval with timeout (30 minutes)
+					const approvalTimeout = 30 * 60 * 1000;
+					const timeoutPromise = new Promise<never>((_, reject) =>
+						setTimeout(
+							() => reject(new Error("Approval timeout")),
+							approvalTimeout,
+						),
+					);
 
+					const { approved, feedback } = await Promise.race([
+						approvalRequest.promise,
+						timeoutPromise,
+					]);
+
+					if (!approved) {
 						console.log(
-							`[AgentSessionManager] Successfully sent child result to parent session ${parentAgentSessionId}`,
+							`[AgentSessionManager] Approval rejected for session ${linearAgentActivitySessionId}`,
 						);
-					} catch (error) {
-						console.error(
-							`[AgentSessionManager] Failed to resume parent session with child result:`,
-							error,
+						await this.createErrorActivity(
+							linearAgentActivitySessionId,
+							`Workflow stopped: User rejected approval.${feedback ? `\n\nFeedback: ${feedback}` : ""}`,
+						);
+						return; // Stop workflow
+					}
+
+					console.log(
+						`[AgentSessionManager] Approval granted, continuing to next subroutine`,
+					);
+
+					// Optionally post feedback as a thought
+					if (feedback) {
+						await this.createThoughtActivity(
+							linearAgentActivitySessionId,
+							`User feedback: ${feedback}`,
 						);
 					}
+
+					// Continue with advancement (fall through to existing code)
+				} catch (error) {
+					const errorMessage = (error as Error).message;
+					if (errorMessage === "Approval timeout") {
+						console.log(
+							`[AgentSessionManager] Approval timed out for session ${linearAgentActivitySessionId}`,
+						);
+						await this.createErrorActivity(
+							linearAgentActivitySessionId,
+							"Workflow stopped: Approval request timed out after 30 minutes.",
+						);
+					} else {
+						console.error(
+							`[AgentSessionManager] Approval request failed:`,
+							error,
+						);
+						await this.createErrorActivity(
+							linearAgentActivitySessionId,
+							`Workflow stopped: Approval request failed - ${errorMessage}`,
+						);
+					}
+					return; // Stop workflow
 				}
 			}
+
+			// Advance procedure state
+			console.log(
+				`[AgentSessionManager] Subroutine completed, advancing to next: ${nextSubroutine.name}`,
+			);
+			this.procedureRouter.advanceToNextSubroutine(session, claudeSessionId);
+
+			// Trigger next subroutine
+			if (this.resumeNextSubroutine) {
+				try {
+					await this.resumeNextSubroutine(linearAgentActivitySessionId);
+				} catch (error) {
+					console.error(
+						`[AgentSessionManager] Failed to trigger next subroutine:`,
+						error,
+					);
+				}
+			}
+		} else {
+			// Procedure complete - post final result
+			console.log(
+				`[AgentSessionManager] All subroutines completed, posting final result to Linear`,
+			);
+			await this.addResultEntry(linearAgentActivitySessionId, resultMessage);
+
+			// Handle child session completion
+			const isChildSession = this.getParentSessionId?.(
+				linearAgentActivitySessionId,
+			);
+			if (isChildSession && this.resumeParentSession) {
+				await this.handleChildSessionCompletion(
+					linearAgentActivitySessionId,
+					resultMessage,
+				);
+			}
+		}
+	}
+
+	/**
+	 * Handle child session completion and resume parent
+	 */
+	private async handleChildSessionCompletion(
+		linearAgentActivitySessionId: string,
+		resultMessage: SDKResultMessage,
+	): Promise<void> {
+		if (!this.getParentSessionId || !this.resumeParentSession) {
+			return;
+		}
+
+		const parentAgentSessionId = this.getParentSessionId(
+			linearAgentActivitySessionId,
+		);
+
+		if (!parentAgentSessionId) {
+			console.error(
+				`[AgentSessionManager] No parent session ID found for child ${linearAgentActivitySessionId}`,
+			);
+			return;
+		}
+
+		console.log(
+			`[AgentSessionManager] Child session ${linearAgentActivitySessionId} completed, resuming parent ${parentAgentSessionId}`,
+		);
+
+		try {
+			const childResult =
+				"result" in resultMessage
+					? resultMessage.result
+					: "No result available";
+			const promptToParent = `Child agent session ${linearAgentActivitySessionId} completed with result:\n\n${childResult}`;
+
+			await this.resumeParentSession(
+				parentAgentSessionId,
+				promptToParent,
+				linearAgentActivitySessionId,
+			);
+
+			console.log(
+				`[AgentSessionManager] Successfully resumed parent session ${parentAgentSessionId}`,
+			);
+		} catch (error) {
+			console.error(
+				`[AgentSessionManager] Failed to resume parent session:`,
+				error,
+			);
 		}
 	}
 
@@ -279,7 +507,7 @@ export class AgentSessionManager {
 							message,
 						);
 
-						// Post model notification thought
+						// Post model notification
 						const systemMessage = message as SDKSystemMessage;
 						if (systemMessage.model) {
 							await this.postModelNotificationThought(
@@ -361,18 +589,14 @@ export class AgentSessionManager {
 		linearAgentActivitySessionId: string,
 		resultMessage: SDKResultMessage,
 	): Promise<void> {
-		const normalizedResult = this.normalizeResultEntry(resultMessage);
-
 		const resultEntry: CyrusAgentSessionEntry = {
 			claudeSessionId: resultMessage.session_id,
 			type: "result",
-			content: normalizedResult.content,
+			content: "result" in resultMessage ? resultMessage.result : "",
 			metadata: {
 				timestamp: Date.now(),
 				durationMs: resultMessage.duration_ms,
-				isError: normalizedResult.isError,
-				isTerminalError: normalizedResult.isTerminalError,
-				resultSubtype: normalizedResult.subtype,
+				isError: resultMessage.is_error,
 			},
 		};
 
@@ -406,6 +630,13 @@ export class AgentSessionManager {
 						return JSON.stringify(block.input, null, 2);
 					} else if (block.type === "tool_result") {
 						// For tool_result blocks, extract just the text content
+						// Also store the error status in metadata if needed
+						if ("is_error" in block && block.is_error) {
+							// Mark this as an error result - we'll handle this elsewhere
+						}
+						if (typeof block.content === "string") {
+							return block.content;
+						}
 						if (Array.isArray(block.content)) {
 							return block.content
 								.filter((contentBlock: any) => contentBlock.type === "text")
@@ -452,9 +683,11 @@ export class AgentSessionManager {
 	}
 
 	/**
-	 * Extract tool_use_id from Claude user message containing tool_result
+	 * Extract tool_use_id and error status from Claude user message containing tool_result
 	 */
-	private extractToolResultId(sdkMessage: SDKUserMessage): string | null {
+	private extractToolResultInfo(
+		sdkMessage: SDKUserMessage,
+	): { toolUseId: string; isError: boolean } | null {
 		const message = sdkMessage.message as APIUserMessage;
 
 		if (Array.isArray(message.content)) {
@@ -462,213 +695,28 @@ export class AgentSessionManager {
 				(block) => block.type === "tool_result",
 			);
 			if (toolResult && "tool_use_id" in toolResult) {
-				return toolResult.tool_use_id;
+				return {
+					toolUseId: toolResult.tool_use_id,
+					isError: "is_error" in toolResult && toolResult.is_error === true,
+				};
 			}
 		}
 		return null;
 	}
 
-	private normalizeResultEntry(resultMessage: SDKResultMessage): {
-		content: string;
-		isError: boolean;
-		isTerminalError: boolean;
-		subtype: string;
-	} {
-		const subtype =
-			typeof resultMessage.subtype === "string"
-				? resultMessage.subtype
-				: "error";
-
-		if (subtype === "success") {
-			const successContent =
-				"result" in resultMessage && typeof resultMessage.result === "string"
-					? resultMessage.result
-					: "";
-			return {
-				content: successContent,
-				isError: Boolean(resultMessage.is_error),
-				isTerminalError: false,
-				subtype,
-			};
-		}
-
-		const content = this.buildResultErrorMessage(resultMessage);
-
-		const hasExplicitNonErrorFlag =
-			typeof resultMessage.is_error === "boolean" &&
-			resultMessage.is_error === false;
+	/**
+	 * Extract tool result content and error status from session entry
+	 */
+	private extractToolResult(
+		entry: CyrusAgentSessionEntry,
+	): { content: string; isError: boolean } | null {
+		// Check if we have the error status in metadata
+		const isError = entry.metadata?.toolResultError || false;
 
 		return {
-			content,
-			isError: true,
-			isTerminalError:
-				!hasExplicitNonErrorFlag && !this.isNonTerminalResultSubtype(subtype),
-			subtype,
+			content: entry.content,
+			isError: isError,
 		};
-	}
-
-	private isNonTerminalResultSubtype(subtype: string): boolean {
-		const normalized = subtype.trim().toLowerCase();
-		if (!normalized) {
-			return false;
-		}
-		if (
-			normalized === "error_during_execution" ||
-			normalized.includes("tool") ||
-			normalized.endsWith("_retryable")
-		) {
-			return true;
-		}
-		return false;
-	}
-
-	private formatResultSubtypeLabel(subtype: string): string {
-		const normalized = subtype
-			.trim()
-			.replace(/[_\s]+/g, " ")
-			.toLowerCase();
-		if (!normalized) {
-			return "unknown error";
-		}
-		return normalized.charAt(0).toUpperCase() + normalized.slice(1);
-	}
-
-	private describeResultSubtype(subtype: string): string {
-		const normalized = subtype.trim().toLowerCase();
-		switch (normalized) {
-			case "success":
-				return "Run completed successfully.";
-			case "error_during_execution":
-				return "Tool execution failed during the run.";
-			case "error_max_turns":
-				return "Run stopped after reaching the maximum number of turns.";
-			case "error":
-				return "Run encountered an error.";
-			default:
-				return `Run ended with ${this.formatResultSubtypeLabel(subtype)}.`;
-		}
-	}
-
-	private buildResultErrorMessage(resultMessage: SDKResultMessage): string {
-		const subtype =
-			typeof resultMessage.subtype === "string"
-				? resultMessage.subtype
-				: "error";
-
-		const parts: string[] = [];
-
-		const description = this.describeResultSubtype(subtype);
-		if (description) {
-			parts.push(description);
-		}
-
-		const errorDetail = this.extractResultErrorDetail(resultMessage);
-		if (errorDetail) {
-			parts.push(errorDetail);
-		}
-
-		if ("result" in resultMessage && resultMessage.result) {
-			const trimmed = resultMessage.result.trim();
-			if (trimmed.length > 0) {
-				parts.push(trimmed);
-			}
-		}
-
-		if (
-			Array.isArray(resultMessage.permission_denials) &&
-			resultMessage.permission_denials.length > 0
-		) {
-			const permissionSummary = resultMessage.permission_denials
-				.map((denial) => this.formatPermissionDenialSummary(denial))
-				.filter((value): value is string => Boolean(value))
-				.join("\n");
-			if (permissionSummary) {
-				parts.push(`Permissions:\n${permissionSummary}`);
-			}
-		}
-
-		const message = parts
-			.map((part) => part.trim())
-			.filter(Boolean)
-			.join("\n\n");
-		if (message.length > 0) {
-			return message;
-		}
-
-		return "Run ended with an unknown error.";
-	}
-
-	private extractResultErrorDetail(
-		resultMessage: SDKResultMessage,
-	): string | undefined {
-		const errorValue = (resultMessage as any).error;
-		if (typeof errorValue === "string" && errorValue.trim().length > 0) {
-			return errorValue.trim();
-		}
-		if (errorValue && typeof errorValue === "object") {
-			const prioritizedKeys = ["message", "detail", "details", "reason"];
-			for (const key of prioritizedKeys) {
-				const value = (errorValue as Record<string, unknown>)[key];
-				if (typeof value === "string" && value.trim().length > 0) {
-					return value.trim();
-				}
-			}
-			try {
-				const serialized = JSON.stringify(errorValue);
-				if (serialized && serialized !== "{}") {
-					return serialized;
-				}
-			} catch (_error) {
-				// ignore serialization issues
-			}
-		}
-
-		const reason = (resultMessage as any).reason;
-		if (typeof reason === "string" && reason.trim().length > 0) {
-			return reason.trim();
-		}
-
-		return undefined;
-	}
-
-	private formatPermissionDenialSummary(
-		denial: SDKPermissionDenialLike,
-	): string | undefined {
-		if (!denial) {
-			return undefined;
-		}
-
-		const name =
-			typeof denial.tool_name === "string" ? denial.tool_name.trim() : "";
-		const toolId =
-			typeof denial.tool_use_id === "string" ? denial.tool_use_id.trim() : "";
-
-		let summary = name || "Tool";
-		if (toolId) {
-			summary = `${summary} (${toolId})`;
-		}
-
-		const input = denial.tool_input;
-		if (input && typeof input === "object") {
-			try {
-				const serialized = JSON.stringify(input);
-				if (serialized && serialized !== "{}") {
-					return `${summary}: ${serialized}`;
-				}
-			} catch (_error) {
-				// ignore serialization issues
-			}
-		}
-
-		return summary.length > 0 ? summary : undefined;
-	}
-
-	private formatInlineErrorBody(body: string): string {
-		const trimmed = body.trim();
-		if (trimmed.length === 0) {
-			return "❌ Error encountered.";
-		}
-		return trimmed.startsWith("❌") ? trimmed : `❌ ${trimmed}`;
 	}
 
 	/**
@@ -687,13 +735,14 @@ export class AgentSessionManager {
 				return;
 			}
 
-			// Store entry locally now that we're posting it
+			// Store entry locally first
 			const entries = this.entries.get(linearAgentActivitySessionId) || [];
 			entries.push(entry);
 			this.entries.set(linearAgentActivitySessionId, entries);
 
 			// Build activity content based on entry type
 			let content: any;
+			let ephemeral = false;
 			switch (entry.type) {
 				case "user": {
 					const activeTaskId = this.activeTasksBySession.get(
@@ -705,15 +754,73 @@ export class AgentSessionManager {
 							body: `✅ Task Completed\n\n\n\n${entry.content}\n\n---\n\n`,
 						};
 						this.activeTasksBySession.delete(linearAgentActivitySessionId);
+					} else if (entry.metadata?.toolUseId) {
+						// This is a tool result - create an action activity with the result
+						const toolResult = this.extractToolResult(entry);
+						if (toolResult) {
+							// Get the original tool information
+							const originalTool = this.toolCallsByToolUseId.get(
+								entry.metadata.toolUseId,
+							);
+							const toolName = originalTool?.name || "Tool";
+							const toolInput = originalTool?.input || "";
+
+							// Clean up the tool call from our tracking map
+							if (entry.metadata.toolUseId) {
+								this.toolCallsByToolUseId.delete(entry.metadata.toolUseId);
+							}
+
+							// Skip creating activity for TodoWrite results since TodoWrite already created a non-ephemeral thought
+							if (toolName === "TodoWrite" || toolName === "↪ TodoWrite") {
+								return;
+							}
+
+							// Format input for display
+							const formattedInput =
+								typeof toolInput === "string"
+									? toolInput
+									: JSON.stringify(toolInput, null, 2);
+
+							// Use tool output directly without collapsible wrapping
+							const wrappedResult = toolResult.content?.trim() || "";
+
+							content = {
+								type: "action",
+								action: toolResult.isError ? `${toolName} (Error)` : toolName,
+								parameter: formattedInput,
+								result: wrappedResult,
+							};
+						} else {
+							return;
+						}
 					} else {
 						return;
 					}
 					break;
 				}
-				case "assistant":
+				case "assistant": {
 					// Assistant messages can be thoughts or responses
 					if (entry.metadata?.toolUseId) {
 						const toolName = entry.metadata.toolName || "Tool";
+
+						// Store tool information for later use in tool results
+						if (entry.metadata.toolUseId) {
+							// Check if this is a subtask with arrow prefix
+							let storedName = toolName;
+							if (entry.metadata?.parentToolUseId) {
+								const activeTaskId = this.activeTasksBySession.get(
+									linearAgentActivitySessionId,
+								);
+								if (activeTaskId === entry.metadata?.parentToolUseId) {
+									storedName = `↪ ${toolName}`;
+								}
+							}
+
+							this.toolCallsByToolUseId.set(entry.metadata.toolUseId, {
+								name: storedName,
+								input: entry.metadata.toolInput || entry.content,
+							});
+						}
 
 						// Special handling for TodoWrite tool - treat as thought instead of action
 						if (toolName === "TodoWrite") {
@@ -724,6 +831,8 @@ export class AgentSessionManager {
 								type: "thought",
 								body: formattedTodos,
 							};
+							// TodoWrite is not ephemeral
+							ephemeral = false;
 						} else if (toolName === "Task") {
 							// Special handling for Task tool - add start marker and track active task
 							const parameter = entry.content;
@@ -743,6 +852,8 @@ export class AgentSessionManager {
 								parameter: parameter,
 								// result will be added later when we get tool result
 							};
+							// Task is not ephemeral
+							ephemeral = false;
 						} else {
 							// Other tools - check if they're within an active Task
 							const parameter = entry.content;
@@ -763,6 +874,8 @@ export class AgentSessionManager {
 								parameter: parameter,
 								// result will be added later when we get tool result
 							};
+							// Standard tool calls are ephemeral
+							ephemeral = true;
 						}
 					} else {
 						// Regular assistant message - create a thought
@@ -772,6 +885,7 @@ export class AgentSessionManager {
 						};
 					}
 					break;
+				}
 
 				case "system":
 					// System messages are thoughts
@@ -781,58 +895,20 @@ export class AgentSessionManager {
 					};
 					break;
 
-				case "result": {
-					const subtype = entry.metadata?.resultSubtype;
-					const isExplicitError = Boolean(entry.metadata?.isError);
-					const isError =
-						isExplicitError ||
-						(typeof subtype === "string" && subtype !== "success");
-
-					const trimmedContent = entry.content.trim();
-					const fallbackBody =
-						typeof subtype === "string" && subtype !== "success"
-							? this.describeResultSubtype(subtype)
-							: "";
-					const baseBody =
-						trimmedContent.length > 0 ? trimmedContent : fallbackBody.trim();
-
-					if (isError) {
-						const isTerminal =
-							entry.metadata?.isTerminalError ??
-							(typeof subtype === "string"
-								? !this.isNonTerminalResultSubtype(subtype)
-								: true);
-
-						const body =
-							baseBody.length > 0
-								? baseBody
-								: this.describeResultSubtype(
-										typeof subtype === "string" ? subtype : "error",
-									);
-
-						if (isTerminal) {
-							content = {
-								type: "error",
-								body,
-							};
-						} else {
-							content = {
-								type: "thought",
-								body: this.formatInlineErrorBody(body),
-							};
-						}
+				case "result":
+					// Result messages can be responses or errors
+					if (entry.metadata?.isError) {
+						content = {
+							type: "error",
+							body: entry.content,
+						};
 					} else {
-						const responseBody =
-							baseBody.length > 0
-								? baseBody
-								: this.describeResultSubtype("success");
 						content = {
 							type: "response",
-							body: responseBody,
+							body: entry.content,
 						};
 					}
 					break;
-				}
 
 				default:
 					// Default to thought
@@ -842,9 +918,24 @@ export class AgentSessionManager {
 					};
 			}
 
-			const activityInput = {
+			// Check if current subroutine has suppressThoughtPosting enabled
+			// If so, suppress thoughts and actions (but still post responses and results)
+			const currentSubroutine =
+				this.procedureRouter?.getCurrentSubroutine(session);
+			if (currentSubroutine?.suppressThoughtPosting) {
+				// Only suppress thoughts and actions, not responses or results
+				if (content.type === "thought" || content.type === "action") {
+					console.log(
+						`[AgentSessionManager] Suppressing ${content.type} posting for subroutine "${currentSubroutine.name}"`,
+					);
+					return; // Don't post to Linear
+				}
+			}
+
+			const activityInput: LinearDocument.AgentActivityCreateInput = {
 				agentSessionId: session.linearAgentActivitySessionId, // Use the Linear session ID
 				content,
+				...(ephemeral && { ephemeral: true }),
 			};
 
 			const result = await this.linearClient.createAgentActivity(activityInput);
@@ -1111,6 +1202,80 @@ export class AgentSessionManager {
 		}
 	}
 
+	private async handleResultWithoutProcedure(
+		sessionId: string,
+		resultMessage: SDKResultMessage,
+	): Promise<void> {
+		const errorMessage = this.extractResultError(resultMessage);
+		const subtype = resultMessage.subtype;
+
+		// Successful completion - post the final response
+		if (subtype === "success" || resultMessage.is_error === false) {
+			const maybeResult = (resultMessage as { result?: unknown }).result;
+			const body =
+				typeof maybeResult === "string"
+					? maybeResult
+					: maybeResult != null
+						? JSON.stringify(maybeResult, null, 2)
+						: "Task completed successfully.";
+			await this.createResponseActivity(sessionId, body);
+			return;
+		}
+
+		const recoverableSubtypes = new Set([
+			"error_during_execution",
+			"error_permission_denied",
+			"error_tool_failed",
+		]);
+
+		if (subtype && recoverableSubtypes.has(subtype)) {
+			const message = this.formatInlineErrorMessage(
+				errorMessage ?? "A recoverable error occurred.",
+			);
+			await this.createThoughtActivity(sessionId, message);
+			return;
+		}
+
+		const body = errorMessage ?? "Agent session encountered an error.";
+		await this.createErrorActivity(sessionId, body);
+	}
+
+	private extractResultError(
+		resultMessage: SDKResultMessage,
+	): string | undefined {
+		const rawError = (resultMessage as unknown as { error?: unknown }).error;
+		if (!rawError) {
+			return undefined;
+		}
+
+		if (typeof rawError === "string") {
+			return rawError;
+		}
+
+		if (
+			typeof rawError === "object" &&
+			rawError !== null &&
+			"message" in rawError &&
+			typeof (rawError as { message: unknown }).message === "string"
+		) {
+			return (rawError as { message: string }).message;
+		}
+
+		try {
+			return JSON.stringify(rawError);
+		} catch (_error) {
+			return undefined;
+		}
+	}
+
+	private formatInlineErrorMessage(message: string): string {
+		const trimmed = (message ?? "").trim();
+		if (trimmed.length === 0) {
+			return "❌ Error encountered.";
+		}
+		return trimmed.startsWith("❌") ? trimmed : `❌ ${trimmed}`;
+	}
+
 	/**
 	 * Create an error activity
 	 */
@@ -1187,6 +1352,53 @@ export class AgentSessionManager {
 		} catch (error) {
 			console.error(
 				`[AgentSessionManager] Error creating elicitation activity:`,
+				error,
+			);
+		}
+	}
+
+	/**
+	 * Create an approval elicitation activity with auth signal
+	 */
+	async createApprovalElicitation(
+		sessionId: string,
+		body: string,
+		approvalUrl: string,
+	): Promise<void> {
+		const session = this.sessions.get(sessionId);
+		if (!session || !session.linearAgentActivitySessionId) {
+			console.warn(
+				`[AgentSessionManager] No Linear session ID for session ${sessionId}`,
+			);
+			return;
+		}
+
+		try {
+			const result = await this.linearClient.createAgentActivity({
+				agentSessionId: session.linearAgentActivitySessionId,
+				content: {
+					type: "elicitation",
+					body,
+				},
+				signal: LinearDocument.AgentActivitySignal.Auth,
+				signalMetadata: {
+					url: approvalUrl,
+				},
+			});
+
+			if (result.success) {
+				console.log(
+					`[AgentSessionManager] Created approval elicitation for session ${sessionId} with URL: ${approvalUrl}`,
+				);
+			} else {
+				console.error(
+					`[AgentSessionManager] Failed to create approval elicitation:`,
+					result,
+				);
+			}
+		} catch (error) {
+			console.error(
+				`[AgentSessionManager] Error creating approval elicitation:`,
 				error,
 			);
 		}
@@ -1304,9 +1516,78 @@ export class AgentSessionManager {
 			);
 		}
 	}
+
+	/**
+	 * Post an ephemeral "Routing your request..." thought and return the activity ID
+	 */
+	async postRoutingThought(
+		linearAgentActivitySessionId: string,
+	): Promise<string | null> {
+		try {
+			const result = await this.linearClient.createAgentActivity({
+				agentSessionId: linearAgentActivitySessionId,
+				content: {
+					type: "thought",
+					body: "Routing your request…",
+				},
+				ephemeral: true,
+			});
+
+			if (result.success && result.agentActivity) {
+				const activity = await result.agentActivity;
+				console.log(
+					`[AgentSessionManager] Posted routing thought for session ${linearAgentActivitySessionId}`,
+				);
+				return activity.id;
+			} else {
+				console.error(
+					`[AgentSessionManager] Failed to post routing thought:`,
+					result,
+				);
+				return null;
+			}
+		} catch (error) {
+			console.error(
+				`[AgentSessionManager] Error posting routing thought:`,
+				error,
+			);
+			return null;
+		}
+	}
+
+	/**
+	 * Post the procedure selection result as a non-ephemeral thought
+	 */
+	async postProcedureSelectionThought(
+		linearAgentActivitySessionId: string,
+		procedureName: string,
+		classification: string,
+	): Promise<void> {
+		try {
+			const result = await this.linearClient.createAgentActivity({
+				agentSessionId: linearAgentActivitySessionId,
+				content: {
+					type: "thought",
+					body: `Selected procedure: **${procedureName}** (classified as: ${classification})`,
+				},
+				ephemeral: false,
+			});
+
+			if (result.success) {
+				console.log(
+					`[AgentSessionManager] Posted procedure selection for session ${linearAgentActivitySessionId}: ${procedureName}`,
+				);
+			} else {
+				console.error(
+					`[AgentSessionManager] Failed to post procedure selection:`,
+					result,
+				);
+			}
+		} catch (error) {
+			console.error(
+				`[AgentSessionManager] Error posting procedure selection:`,
+				error,
+			);
+		}
+	}
 }
-type SDKPermissionDenialLike = {
-	tool_name?: string;
-	tool_use_id?: string;
-	tool_input?: Record<string, unknown>;
-};

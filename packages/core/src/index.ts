@@ -9,6 +9,25 @@ export type {
 	Workspace,
 } from "./CyrusAgentSession.js";
 
+// Configuration types
+export type {
+	ClassifierConfig,
+	CliDefaults,
+	CodexCliDefaults,
+	CodexRunnerModelConfig,
+	EdgeConfig,
+	EdgeCredentials,
+	EdgeWorkerConfig,
+	OAuthCallbackHandler,
+	ProcedureRunnerOverride,
+	PromptRuleConfig,
+	PromptToolPreset,
+	RepositoryConfig,
+	RepositoryLabelAgentRoutingRule,
+	RepositoryRunnerModels,
+	RunnerType,
+} from "./config-types.js";
+
 // Constants
 export { DEFAULT_PROXY_URL } from "./constants.js";
 export type {
@@ -38,9 +57,13 @@ export type {
 	LinearWebhookAgentSession,
 	LinearWebhookComment,
 	LinearWebhookCreator,
+	LinearWebhookGuidanceRule,
 	LinearWebhookIssue,
 	LinearWebhookNotification,
+	LinearWebhookOrganizationOrigin,
 	LinearWebhookTeam,
+	LinearWebhookTeamOrigin,
+	LinearWebhookTeamWithParent,
 } from "./webhook-types.js";
 export {
 	isAgentSessionCreatedWebhook,

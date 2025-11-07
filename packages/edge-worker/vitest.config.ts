@@ -25,6 +25,19 @@ export default defineConfig({
 		alias: {
 			"@": path.resolve(__dirname, "./src"),
 			"@test": path.resolve(__dirname, "./test"),
+			"cyrus-core": path.resolve(__dirname, "../core/src/index.ts"),
+			"cyrus-claude-runner": path.resolve(
+				__dirname,
+				"../claude-runner/src/index.ts",
+			),
+			"cyrus-agent-runner": path.resolve(
+				__dirname,
+				"../agent-runner/src/index.ts",
+			),
+			"cyrus-simple-agent-runner": path.resolve(
+				__dirname,
+				"../simple-agent-runner/src/index.ts",
+			),
 		},
 	},
 });

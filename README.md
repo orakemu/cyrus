@@ -113,6 +113,42 @@ When multiple routing configurations are present, Cyrus evaluates them in the fo
 
 If an issue matches multiple routing configurations, the highest priority match will be used. For example, if an issue has a label that matches `routingLabels` and also belongs to a project in `projectKeys`, the label-based routing will take precedence.
 
+### Runner Selection Controls
+
+Cyrus now exposes explicit configuration knobs for choosing between Claude and Codex at different stages of the workflow:
+
+- **Global defaults (`classifier`, `procedureDefaults`)** live at the root of `~/.cyrus/config.json`. Use `classifier` to tune the model that performs intelligent routing (defaults to Claude Haiku). Use `procedureDefaults` to map procedure names (for example, `full-development`, `orchestrator-full`, `debugger-full`) to a preferred runner/model pair.
+- **Repository overrides (`classifierOverride`, `procedureOverrides`)** live beside each repository entry and work the same way, letting you opt specific repos or procedures into Codex or a Claude variant.
+
+When any of these settings select the Codex runner, the edge worker validates two prerequisites on startup: an OpenAI API key must be available (environment variable, global `credentials.openaiApiKey`, or repository-level `openaiApiKey`), and the Codex CLI must be installed (`codex --version`). If either check fails, startup aborts with a descriptive error so the configuration can be corrected.
+
+#### Example Workflow
+
+```bash
+# 1. Provide Codex credentials (optional if using env vars)
+cyrus connect-openai --non-interactive --api-key "$OPENAI_API_KEY"
+#    CLI automatically detects codex-cli versions and pipes the key when required.
+
+# 2. Establish global defaults
+cyrus set-default-cli claude
+cyrus set-default-model claude claude-3.7-sonnet
+cyrus set-default-model codex o3-mini
+
+# 3. Route classification + procedures
+cyrus set-classifier codex o3-mini
+cyrus set-procedure-default full-development codex o3-mini
+cyrus set-procedure-default orchestrator-full claude claude-3.7-sonnet
+
+# 4. Add repositories (interactive wizard)
+cyrus add-repository
+
+# 5. Validate the environment before starting agents
+cyrus validate
+#    Performs 'codex login status' to verify authentication and CLI availability.
+```
+
+The validation command runs the same guardrails the edge worker enforces at startup, ensuring Codex prerequisites are in place before sessions begin.
+
 #### `labelPrompts` (object)
 Routes issues to different AI modes based on Linear labels and optionally configures allowed tools per mode.
 
@@ -406,6 +442,42 @@ echo "Repository setup complete for issue: $LINEAR_ISSUE_IDENTIFIER"
 ```
 
 Make sure the script is executable: `chmod +x cyrus-setup.sh`
+
+## Global Setup Script
+
+In addition to repository-specific `cyrus-setup.sh` scripts, you can configure a global setup script that runs for **all** repositories when creating new worktrees.
+
+### Configuration
+
+Add `global_setup_script` to your `~/.cyrus/config.json`:
+
+```json
+{
+  "repositories": [...],
+  "global_setup_script": "/opt/cyrus/bin/global-setup.sh"
+}
+```
+
+### Execution Order
+
+When creating a new worktree:
+1. **Global script** runs first (if configured)
+2. **Repository script** (`cyrus-setup.sh`) runs second (if exists)
+
+Both scripts receive the same environment variables and run in the worktree directory.
+
+### Use Cases
+
+- **Team-wide tooling** that applies to all repositories
+- **Shared credential** setup
+
+Make sure the script is executable: `chmod +x /opt/cyrus/bin/global-setup.sh`
+
+### Error Handling
+
+- If the global script fails, Cyrus logs the error but continues with repository script execution
+- Both scripts have a 5-minute timeout to prevent hanging
+- Script failures don't prevent worktree creation
 
 ## Submitting Work To GitHub
 

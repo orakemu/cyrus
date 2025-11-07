@@ -1,5 +1,5 @@
 import { basename, extname } from "node:path";
-import { createSdkMcpServer, tool } from "@anthropic-ai/claude-code";
+import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { LinearClient } from "@linear/sdk";
 import fs from "fs-extra";
 import { z } from "zod";
@@ -493,13 +493,15 @@ export function createCyrusToolsServer(
 			}
 
 			// Deliver the feedback through the callback if provided
-			let delivered = false;
 			if (options.onFeedbackDelivery) {
 				console.log(
 					`[CyrusTools] Delivering feedback to child session ${agentSessionId}`,
 				);
 				try {
-					delivered = await options.onFeedbackDelivery(agentSessionId, message);
+					const delivered = await options.onFeedbackDelivery(
+						agentSessionId,
+						message,
+					);
 					if (delivered) {
 						console.log(
 							`[CyrusTools] Feedback delivered successfully to parent session`,
@@ -514,15 +516,13 @@ export function createCyrusToolsServer(
 				}
 			}
 
-			// Return success even if delivery wasn't possible
-			// (the child session might not have a parent)
+			// Return success - feedback has been queued for delivery
 			return {
 				content: [
 					{
 						type: "text" as const,
 						text: JSON.stringify({
 							success: true,
-							delivered,
 						}),
 					},
 				],

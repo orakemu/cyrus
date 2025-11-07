@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import {
@@ -14,6 +15,7 @@ import {
 	LinearClient,
 	type Issue as LinearIssue,
 } from "@linear/sdk";
+import { watch as chokidarWatch, type FSWatcher } from "chokidar";
 import {
 	DefaultRunnerFactory,
 	type Runner,
@@ -30,8 +32,11 @@ import type {
 	SDKMessage,
 } from "cyrus-claude-runner";
 import {
+	AbortError,
 	ClaudeRunner,
 	createCyrusToolsServer,
+	createImageToolsServer,
+	createSoraToolsServer,
 	getAllTools,
 	getCoordinatorTools,
 	getReadOnlyTools,
@@ -39,6 +44,7 @@ import {
 } from "cyrus-claude-runner";
 import type {
 	CyrusAgentSession,
+	EdgeWorkerConfig,
 	IssueMinimal,
 	LinearAgentSessionCreatedWebhook,
 	LinearAgentSessionPromptedWebhook,
@@ -49,11 +55,13 @@ import type {
 	LinearWebhook,
 	LinearWebhookAgentSession,
 	LinearWebhookComment,
+	LinearWebhookGuidanceRule,
 	LinearWebhookIssue,
+	ProcedureRunnerOverride,
+	RepositoryConfig,
 	SerializableEdgeWorkerState,
 	SerializedCyrusAgentSession,
 	SerializedCyrusAgentSessionEntry,
-	SerializedSessionRunnerSelection,
 } from "cyrus-core";
 import {
 	isAgentSessionCreatedWebhook,
@@ -68,16 +76,60 @@ import { LinearWebhookClient } from "cyrus-linear-webhook-client";
 import { NdjsonClient } from "cyrus-ndjson-client";
 import { fileTypeFromBuffer } from "file-type";
 import { AgentSessionManager } from "./AgentSessionManager.js";
-import { SharedApplicationServer } from "./SharedApplicationServer.js";
+import {
+	type ProcedureDefinition,
+	type ProcedureMetadata,
+	ProcedureRouter,
+	type RequestClassification,
+	type SubroutineDefinition,
+} from "./procedures/index.js";
 import type {
-	EdgeWorkerConfig,
-	EdgeWorkerEvents,
-	LinearAgentSessionData,
-	PromptRuleConfig,
-	RepositoryConfig,
-} from "./types.js";
+	IssueContextResult,
+	PromptAssembly,
+	PromptAssemblyInput,
+	PromptComponent,
+	PromptType,
+} from "./prompt-assembly/types.js";
+import { SharedApplicationServer } from "./SharedApplicationServer.js";
+import type { EdgeWorkerEvents, LinearAgentSessionData } from "./types.js";
 
 type CodexPermissionProfile = "readOnly" | "safe" | "all";
+type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+type CodexApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never";
+
+interface CodexRunnerPermissions {
+	profile: CodexPermissionProfile;
+	sandbox: CodexSandboxMode;
+	approvalPolicy: CodexApprovalPolicy;
+	fullAuto: boolean;
+}
+
+type SystemPromptType = "debugger" | "builder" | "scoper" | "orchestrator";
+
+type RunnerSelection = {
+	type: RunnerType;
+	model?: string;
+	promptType?: SystemPromptType;
+	codexPermissions?: CodexRunnerPermissions;
+};
+
+interface SessionRunnerMetadata extends RunnerSelection {
+	issueId: string;
+	resumeSessionId?: string;
+}
+
+interface StartNonClaudeRunnerOptions {
+	selection: SessionRunnerMetadata;
+	repository: RepositoryConfig;
+	prompt: string;
+	workspacePath: string;
+	linearAgentActivitySessionId: string;
+	issueId?: string;
+	allowedTools?: string[];
+	disallowedTools?: string[];
+	promptType?: SystemPromptType;
+	isFollowUp: boolean;
+}
 
 export const SAFE_BASH_TOOL_ALLOWLIST = [
 	"Bash(git:status*)",
@@ -99,29 +151,6 @@ export const SAFE_BASH_TOOL_ALLOWLIST = [
 	"Bash(gh:auth status*)",
 ];
 
-type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
-
-type CodexApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never";
-
-interface CodexRunnerPermissions {
-	profile: CodexPermissionProfile;
-	sandbox: CodexSandboxMode;
-	approvalPolicy: CodexApprovalPolicy;
-	fullAuto: boolean;
-}
-
-type RunnerSelection = {
-	type: RunnerType;
-	model?: string;
-	promptType?: string;
-	codexPermissions?: CodexRunnerPermissions;
-};
-
-interface SessionRunnerMetadata extends RunnerSelection {
-	issueId: string;
-	resumeSessionId?: string;
-}
-
 export declare interface EdgeWorker {
 	on<K extends keyof EdgeWorkerEvents>(
 		event: K,
@@ -132,17 +161,6 @@ export declare interface EdgeWorker {
 		...args: Parameters<EdgeWorkerEvents[K]>
 	): boolean;
 }
-
-const MODULE_FILENAME = fileURLToPath(import.meta.url);
-const MODULE_DIRNAME = dirname(MODULE_FILENAME);
-const BUILT_IN_PROMPTS_DIR = join(MODULE_DIRNAME, "..", "prompts");
-const BUILT_IN_PROMPT_TYPES = [
-	"debugger",
-	"builder",
-	"scoper",
-	"orchestrator",
-] as const;
-const BUILT_IN_PROMPT_TYPE_SET = new Set<string>(BUILT_IN_PROMPT_TYPES);
 
 /**
  * Unified edge worker that **orchestrates**
@@ -161,6 +179,10 @@ export class EdgeWorker extends EventEmitter {
 	private sharedApplicationServer: SharedApplicationServer;
 	private cyrusHome: string;
 	private childToParentAgentSession: Map<string, string> = new Map(); // Maps child agentSessionId to parent agentSessionId
+	private procedureRouter: ProcedureRouter; // Intelligent workflow routing
+	private configWatcher?: FSWatcher; // File watcher for config.json
+	private configPath?: string; // Path to config.json file
+	private tokenToRepoIds: Map<string, string[]> = new Map(); // Maps Linear token to repository IDs using that token
 	private runnerFactory: RunnerFactory;
 	private sessionRunnerSelections: Map<string, SessionRunnerMetadata> =
 		new Map();
@@ -170,6 +192,280 @@ export class EdgeWorker extends EventEmitter {
 	private stopRequestedSessions: Set<string> = new Set();
 	private codexActivityQueue: Map<string, Promise<void>> = new Map();
 	private codexQueueDrainTimeoutMs = 2000;
+
+	constructor(config: EdgeWorkerConfig) {
+		super();
+		this.config = config;
+		this.cyrusHome = config.cyrusHome;
+		this.persistenceManager = new PersistenceManager(
+			join(this.cyrusHome, "state"),
+		);
+		this.runnerFactory = new DefaultRunnerFactory();
+
+		const classifierRunner = this.normalizeRunnerType(
+			this.config.classifier?.runner,
+			{ scope: "config.classifier.runner" },
+		);
+		if (classifierRunner && classifierRunner !== "claude") {
+			console.warn(
+				"[EdgeWorker] Procedure router currently supports only Claude; ignoring classifier runner",
+				classifierRunner,
+			);
+		}
+		const classifierModel = this.config.classifier?.model ?? "haiku";
+
+		// Initialize procedure router with configurable classifier model
+		this.procedureRouter = new ProcedureRouter({
+			cyrusHome: this.cyrusHome,
+			model: classifierModel,
+			timeoutMs: 10000,
+		});
+
+		console.log(
+			`[EdgeWorker Constructor] Initializing parent-child session mapping system`,
+		);
+		console.log(
+			`[EdgeWorker Constructor] Parent-child mapping initialized with 0 entries`,
+		);
+
+		// Initialize shared application server
+		const serverPort = config.serverPort || config.webhookPort || 3456;
+		const serverHost = config.serverHost || "localhost";
+		this.sharedApplicationServer = new SharedApplicationServer(
+			serverPort,
+			serverHost,
+			config.ngrokAuthToken,
+			config.proxyUrl,
+		);
+
+		// Register OAuth callback handler if provided
+		if (config.handlers?.onOAuthCallback) {
+			this.sharedApplicationServer.registerOAuthCallbackHandler(
+				config.handlers.onOAuthCallback,
+			);
+		}
+
+		// Initialize repositories
+		for (const repo of config.repositories) {
+			if (repo.isActive !== false) {
+				this.repositories.set(repo.id, repo);
+
+				// Create Linear client for this repository's workspace
+				const linearClient = new LinearClient({
+					accessToken: repo.linearToken,
+				});
+				this.linearClients.set(repo.id, linearClient);
+
+				// Create AgentSessionManager for this repository with parent session lookup and resume callback
+				//
+				// Note: This pattern works (despite appearing recursive) because:
+				// 1. The agentSessionManager variable is captured by the closure after it's assigned
+				// 2. JavaScript's variable hoisting means 'agentSessionManager' exists (but is undefined) when the arrow function is created
+				// 3. By the time the callback is actually invoked (when a child session completes), agentSessionManager is fully initialized
+				// 4. The callback only executes asynchronously, well after the constructor has completed and agentSessionManager is assigned
+				//
+				// This allows the AgentSessionManager to call back into itself to access its own sessions,
+				// enabling child sessions to trigger parent session resumption using the same manager instance.
+				const agentSessionManager = new AgentSessionManager(
+					linearClient,
+					(childSessionId: string) => {
+						console.log(
+							`[Parent-Child Lookup] Looking up parent session for child ${childSessionId}`,
+						);
+						const parentId = this.childToParentAgentSession.get(childSessionId);
+						console.log(
+							`[Parent-Child Lookup] Child ${childSessionId} -> Parent ${parentId || "not found"}`,
+						);
+						return parentId;
+					},
+					async (parentSessionId, prompt, childSessionId) => {
+						await this.handleResumeParentSession(
+							parentSessionId,
+							prompt,
+							childSessionId,
+							repo,
+							agentSessionManager,
+						);
+					},
+					async (linearAgentActivitySessionId: string) => {
+						console.log(
+							`[Subroutine Transition] Advancing to next subroutine for session ${linearAgentActivitySessionId}`,
+						);
+
+						// Get the session
+						const session = agentSessionManager.getSession(
+							linearAgentActivitySessionId,
+						);
+						if (!session) {
+							console.error(
+								`[Subroutine Transition] Session ${linearAgentActivitySessionId} not found`,
+							);
+							return;
+						}
+
+						// Get next subroutine (advancement already handled by AgentSessionManager)
+						const nextSubroutine =
+							this.procedureRouter.getCurrentSubroutine(session);
+
+						if (!nextSubroutine) {
+							console.log(
+								`[Subroutine Transition] Procedure complete for session ${linearAgentActivitySessionId}`,
+							);
+							return;
+						}
+
+						console.log(
+							`[Subroutine Transition] Next subroutine: ${nextSubroutine.name}`,
+						);
+
+						// Load subroutine prompt
+						const __filename = fileURLToPath(import.meta.url);
+						const __dirname = dirname(__filename);
+						const subroutinePromptPath = join(
+							__dirname,
+							"prompts",
+							nextSubroutine.promptPath,
+						);
+
+						let subroutinePrompt: string;
+						try {
+							subroutinePrompt = await readFile(subroutinePromptPath, "utf-8");
+							console.log(
+								`[Subroutine Transition] Loaded ${nextSubroutine.name} subroutine prompt (${subroutinePrompt.length} characters)`,
+							);
+						} catch (error) {
+							console.error(
+								`[Subroutine Transition] Failed to load subroutine prompt from ${subroutinePromptPath}:`,
+								error,
+							);
+							// Fallback to simple prompt
+							subroutinePrompt = `Continue with: ${nextSubroutine.description}`;
+						}
+
+						// Resume Claude session with subroutine prompt
+						try {
+							await this.resumeClaudeSession(
+								session,
+								repo,
+								linearAgentActivitySessionId,
+								agentSessionManager,
+								subroutinePrompt,
+								"", // No attachment manifest
+								false, // Not a new session
+								[], // No additional allowed directories
+								nextSubroutine.maxTurns, // Use subroutine-specific maxTurns
+							);
+							console.log(
+								`[Subroutine Transition] Successfully resumed session for ${nextSubroutine.name} subroutine${nextSubroutine.maxTurns ? ` (maxTurns=${nextSubroutine.maxTurns})` : ""}`,
+							);
+						} catch (error) {
+							console.error(
+								`[Subroutine Transition] Failed to resume session for ${nextSubroutine.name} subroutine:`,
+								error,
+							);
+						}
+					},
+					this.procedureRouter,
+					this.sharedApplicationServer,
+				);
+				this.agentSessionManagers.set(repo.id, agentSessionManager);
+			}
+		}
+
+		// Group repositories by token to minimize NDJSON connections
+		const tokenToRepos = new Map<string, RepositoryConfig[]>();
+		for (const repo of this.repositories.values()) {
+			const repos = tokenToRepos.get(repo.linearToken) || [];
+			repos.push(repo);
+			tokenToRepos.set(repo.linearToken, repos);
+
+			// Track token-to-repo-id mapping for dynamic config updates
+			const repoIds = this.tokenToRepoIds.get(repo.linearToken) || [];
+			if (!repoIds.includes(repo.id)) {
+				repoIds.push(repo.id);
+			}
+			this.tokenToRepoIds.set(repo.linearToken, repoIds);
+		}
+
+		// Create one NDJSON client per unique token using shared application server
+		for (const [token, repos] of tokenToRepos) {
+			if (!repos || repos.length === 0) continue;
+			const firstRepo = repos[0];
+			if (!firstRepo) continue;
+			const primaryRepoId = firstRepo.id;
+
+			// Determine which client to use based on environment variable
+			const useLinearDirectWebhooks =
+				process.env.LINEAR_DIRECT_WEBHOOKS?.toLowerCase().trim() === "true";
+
+			const clientConfig = {
+				proxyUrl: config.proxyUrl,
+				token: token,
+				name: repos.map((r) => r.name).join(", "), // Pass repository names
+				transport: "webhook" as const,
+				// Use shared application server instead of individual servers
+				useExternalWebhookServer: true,
+				externalWebhookServer: this.sharedApplicationServer,
+				webhookPort: serverPort, // All clients use same port
+				webhookPath: "/webhook",
+				webhookHost: serverHost,
+				...(config.baseUrl && { webhookBaseUrl: config.baseUrl }),
+				// Legacy fallback support
+				...(!config.baseUrl &&
+					config.webhookBaseUrl && { webhookBaseUrl: config.webhookBaseUrl }),
+				onConnect: () => this.handleConnect(primaryRepoId, repos),
+				onDisconnect: (reason?: string) =>
+					this.handleDisconnect(primaryRepoId, repos, reason),
+				onError: (error: Error) => this.handleError(error),
+			};
+
+			// Create the appropriate client based on configuration
+			const ndjsonClient = useLinearDirectWebhooks
+				? new LinearWebhookClient({
+						...clientConfig,
+						onWebhook: (payload: any) => {
+							// Get fresh repositories for this token to avoid stale closures
+							const freshRepos = this.getRepositoriesForToken(token);
+							this.handleWebhook(
+								payload as unknown as LinearWebhook,
+								freshRepos,
+							);
+						},
+					})
+				: new NdjsonClient(clientConfig);
+
+			// Set up webhook handler for NdjsonClient (LinearWebhookClient uses onWebhook in constructor)
+			if (!useLinearDirectWebhooks) {
+				(ndjsonClient as NdjsonClient).on("webhook", (data) => {
+					// Get fresh repositories for this token to avoid stale closures
+					const freshRepos = this.getRepositoriesForToken(token);
+					this.handleWebhook(data as LinearWebhook, freshRepos);
+				});
+			}
+
+			// Optional heartbeat logging (only for NdjsonClient)
+			if (process.env.DEBUG_EDGE === "true" && !useLinearDirectWebhooks) {
+				(ndjsonClient as NdjsonClient).on("heartbeat", () => {
+					console.log(
+						`❤️ Heartbeat received for token ending in ...${token.slice(-4)}`,
+					);
+				});
+			}
+
+			// Store with the first repo's ID as the key (for error messages)
+			// But also store the token mapping for lookup
+			this.ndjsonClients.set(primaryRepoId, ndjsonClient);
+		}
+	}
+
+	private debugLog(message: string, ...metadata: unknown[]): void {
+		if (process.env.DEBUG_EDGE !== "1") {
+			return;
+		}
+		const timestamp = new Date().toISOString();
+		// eslint-disable-next-line no-console
+		console.log(`[EdgeWorker][${timestamp}] ${message}`, ...metadata);
+	}
 
 	private async drainCodexActivityQueue(
 		linearAgentActivitySessionId: string,
@@ -249,231 +545,971 @@ export class EdgeWorker extends EventEmitter {
 		this.nonClaudeRunners.delete(linearAgentActivitySessionId);
 	}
 
-	constructor(config: EdgeWorkerConfig) {
-		super();
-		this.config = config;
-		this.cyrusHome = config.cyrusHome;
-		console.log(
-			`[EdgeWorker] DEBUG_EDGE env: ${process.env.DEBUG_EDGE ?? "(unset)"}`,
-		);
-		this.persistenceManager = new PersistenceManager(
-			join(this.cyrusHome, "state"),
-		);
-		this.runnerFactory = new DefaultRunnerFactory();
+	private createRunnerSelection(
+		runner: RunnerType,
+		repository: RepositoryConfig,
+		modelOverride?: string,
+	): RunnerSelection {
+		if (runner === "codex") {
+			return {
+				type: "codex",
+				model:
+					modelOverride ??
+					repository.runnerModels?.codex?.model ??
+					this.config.cliDefaults?.codex?.model,
+			};
+		}
+		return {
+			type: "claude",
+			model:
+				modelOverride ??
+				repository.runnerModels?.claude?.model ??
+				repository.model ??
+				this.config.cliDefaults?.claude?.model ??
+				this.config.defaultModel,
+		};
+	}
 
-		console.log(
-			`[EdgeWorker Constructor] Initializing parent-child session mapping system`,
-		);
-		console.log(
-			`[EdgeWorker Constructor] Parent-child mapping initialized with 0 entries`,
-		);
+	private getProcedureOverride(
+		overrides: Record<string, ProcedureRunnerOverride | undefined> | undefined,
+		procedureName?: string,
+		classification?: RequestClassification,
+	): ProcedureRunnerOverride | undefined {
+		if (!overrides) {
+			return undefined;
+		}
+		if (procedureName && overrides[procedureName]) {
+			return overrides[procedureName];
+		}
+		if (classification && overrides[classification]) {
+			return overrides[classification];
+		}
+		return undefined;
+	}
 
-		// Initialize shared application server
-		const serverPort = config.serverPort || config.webhookPort || 3456;
-		const serverHost = config.serverHost || "localhost";
-		this.sharedApplicationServer = new SharedApplicationServer(
-			serverPort,
-			serverHost,
-			config.ngrokAuthToken,
-			config.proxyUrl,
-		);
+	private resolveRunnerSelection(params: {
+		labels: string[];
+		repository: RepositoryConfig;
+		procedureName?: string;
+		classification?: RequestClassification;
+	}): RunnerSelection {
+		const { labels, repository, procedureName, classification } = params;
 
-		// Register OAuth callback handler if provided
-		if (config.handlers?.onOAuthCallback) {
-			this.sharedApplicationServer.registerOAuthCallbackHandler(
-				config.handlers.onOAuthCallback,
+		for (const rule of repository.labelAgentRouting ?? []) {
+			if (!rule.labels.some((label) => labels.includes(label))) continue;
+			const runner = this.normalizeRunnerType(rule.runner, {
+				scope: "labelAgentRouting",
+				repositoryId: repository.id,
+				labels,
+			});
+			if (!runner) continue;
+			const selection = this.createRunnerSelection(
+				runner,
+				repository,
+				rule.model,
+			);
+			this.debugLog(
+				`[resolveRunnerSelection] Matched runner via labelAgentRouting`,
+				{
+					repositoryId: repository.id,
+					runner: selection.type,
+					labels,
+					source: "labelAgentRouting",
+				},
+			);
+			return selection;
+		}
+
+		let pendingModelOverride: string | undefined;
+		const applyOverrideSelection = (
+			override: ProcedureRunnerOverride | undefined,
+			scope: string,
+		): RunnerSelection | null => {
+			if (!override) {
+				return null;
+			}
+			const runner = this.normalizeRunnerType(override.runner, {
+				scope,
+				repositoryId: repository.id,
+			});
+			if (runner) {
+				const selection = this.createRunnerSelection(
+					runner,
+					repository,
+					override.model,
+				);
+				this.debugLog(`[resolveRunnerSelection] Using override runner`, {
+					repositoryId: repository.id,
+					scope,
+					runner: selection.type,
+				});
+				return selection;
+			}
+			if (override.model && !pendingModelOverride) {
+				pendingModelOverride = override.model;
+			}
+			return null;
+		};
+
+		const repoProcedureOverride = this.getProcedureOverride(
+			repository.procedureOverrides,
+			procedureName,
+			classification,
+		);
+		const repoOverrideSelection = applyOverrideSelection(
+			repoProcedureOverride,
+			procedureName
+				? `repository.procedureOverrides["${procedureName}"]`
+				: classification
+					? `repository.procedureOverrides["${classification}"]`
+					: "repository.procedureOverrides",
+		);
+		if (repoOverrideSelection) {
+			return repoOverrideSelection;
+		}
+
+		const globalProcedureOverride = this.getProcedureOverride(
+			this.config.procedureDefaults,
+			procedureName,
+			classification,
+		);
+		const globalOverrideSelection = applyOverrideSelection(
+			globalProcedureOverride,
+			procedureName
+				? `config.procedureDefaults["${procedureName}"]`
+				: classification
+					? `config.procedureDefaults["${classification}"]`
+					: "config.procedureDefaults",
+		);
+		if (globalOverrideSelection) {
+			return globalOverrideSelection;
+		}
+
+		const repoRunner = this.normalizeRunnerType(repository.runner, {
+			scope: "repository.runner",
+			repositoryId: repository.id,
+		});
+		if (repoRunner) {
+			let selection = this.createRunnerSelection(
+				repoRunner,
+				repository,
+				pendingModelOverride,
+			);
+			if (pendingModelOverride && !selection.model) {
+				selection = { ...selection, model: pendingModelOverride };
+			}
+			this.debugLog(`[resolveRunnerSelection] Using repository runner`, {
+				repositoryId: repository.id,
+				runner: selection.type,
+			});
+			return selection;
+		}
+
+		const defaultCli =
+			this.normalizeRunnerType(this.config.defaultCli, {
+				scope: "config.defaultCli",
+				repositoryId: repository.id,
+			}) ?? "claude";
+		let resolved = this.createRunnerSelection(
+			defaultCli,
+			repository,
+			pendingModelOverride,
+		);
+		if (pendingModelOverride) {
+			resolved = { ...resolved, model: pendingModelOverride };
+		}
+
+		this.debugLog(`[resolveRunnerSelection] Using default runner selection`, {
+			repositoryId: repository.id,
+			runner: resolved.type,
+			labels,
+			procedureName,
+			classification,
+		});
+		return resolved;
+	}
+
+	private normalizeRunnerType(
+		runner: unknown,
+		context?: { scope: string; repositoryId?: string; labels?: string[] },
+	): RunnerType | undefined {
+		if (typeof runner === "string") {
+			const value = runner.toLowerCase();
+			if (value === "claude" || value === "codex") {
+				return value as RunnerType;
+			}
+		}
+		if (context) {
+			this.debugLog("[normalizeRunnerType] Ignoring unsupported runner", {
+				scope: context.scope,
+				repositoryId: context.repositoryId,
+				runner,
+				labels: context.labels,
+			});
+		}
+		return undefined;
+	}
+
+	private isCodexRunnerPotentiallyRequired(): boolean {
+		const isCodex = (value: unknown): boolean =>
+			typeof value === "string" && value.toLowerCase() === "codex";
+
+		if (isCodex(this.config.defaultCli)) {
+			return true;
+		}
+		if (isCodex(this.config.classifier?.runner)) {
+			return true;
+		}
+		for (const override of Object.values(this.config.procedureDefaults ?? {})) {
+			if (isCodex(override?.runner)) {
+				return true;
+			}
+		}
+
+		for (const repository of this.config.repositories) {
+			if (isCodex(repository.runner)) {
+				return true;
+			}
+			if (isCodex(repository.classifierOverride?.runner)) {
+				return true;
+			}
+			for (const override of Object.values(
+				repository.procedureOverrides ?? {},
+			)) {
+				if (isCodex(override?.runner)) {
+					return true;
+				}
+			}
+			if (
+				repository.labelAgentRouting?.some((rule) => isCodex(rule.runner)) ??
+				false
+			) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private validateRunnerAvailability(): void {
+		if (!this.isCodexRunnerPotentiallyRequired()) {
+			return;
+		}
+
+		const hasOpenAiKey =
+			Boolean(
+				process.env.OPENAI_API_KEY &&
+					process.env.OPENAI_API_KEY.trim().length > 0,
+			) ||
+			Boolean(this.config.credentials?.openaiApiKey) ||
+			this.config.repositories.some(
+				(repository) =>
+					typeof repository.openaiApiKey === "string" &&
+					repository.openaiApiKey.trim().length > 0,
+			);
+
+		if (!hasOpenAiKey) {
+			throw new Error(
+				"Codex runner is configured but no OpenAI API key is available. Set OPENAI_API_KEY or update credentials.openaiApiKey in ~/.cyrus/config.json.",
 			);
 		}
 
-		// Initialize repositories
-		for (const repo of config.repositories) {
-			if (repo.isActive !== false) {
-				this.repositories.set(repo.id, repo);
-
-				// Create Linear client for this repository's workspace
-				const linearClient = new LinearClient({
-					accessToken: repo.linearToken,
-				});
-				this.linearClients.set(repo.id, linearClient);
-
-				// Create AgentSessionManager for this repository with parent session lookup and resume callback
-				//
-				// Note: This pattern works (despite appearing recursive) because:
-				// 1. The agentSessionManager variable is captured by the closure after it's assigned
-				// 2. JavaScript's variable hoisting means 'agentSessionManager' exists (but is undefined) when the arrow function is created
-				// 3. By the time the callback is actually invoked (when a child session completes), agentSessionManager is fully initialized
-				// 4. The callback only executes asynchronously, well after the constructor has completed and agentSessionManager is assigned
-				//
-				// This allows the AgentSessionManager to call back into itself to access its own sessions,
-				// enabling child sessions to trigger parent session resumption using the same manager instance.
-				const agentSessionManager = new AgentSessionManager(
-					linearClient,
-					(childSessionId: string) => {
-						console.log(
-							`[Parent-Child Lookup] Looking up parent session for child ${childSessionId}`,
-						);
-						const parentId = this.childToParentAgentSession.get(childSessionId);
-						console.log(
-							`[Parent-Child Lookup] Child ${childSessionId} -> Parent ${parentId || "not found"}`,
-						);
-						return parentId;
-					},
-					async (
-						parentSessionId: string,
-						prompt: string,
-						childSessionId: string,
-					) => {
-						console.log(
-							`[Parent Session Resume] Child session completed, resuming parent session ${parentSessionId}`,
-						);
-
-						// Get the parent session and repository
-						// This works because by the time this callback runs, agentSessionManager is fully initialized
-						console.log(
-							`[Parent Session Resume] Retrieving parent session ${parentSessionId} from agent session manager`,
-						);
-						const parentSession =
-							agentSessionManager.getSession(parentSessionId);
-						if (!parentSession) {
-							console.error(
-								`[Parent Session Resume] Parent session ${parentSessionId} not found in agent session manager`,
-							);
-							return;
-						}
-
-						console.log(
-							`[Parent Session Resume] Found parent session - Issue: ${parentSession.issueId}, Workspace: ${parentSession.workspace.path}`,
-						);
-
-						// Get the child session to access its workspace path
-						const childSession = agentSessionManager.getSession(childSessionId);
-						const childWorkspaceDirs: string[] = [];
-						if (childSession) {
-							childWorkspaceDirs.push(childSession.workspace.path);
-							console.log(
-								`[Parent Session Resume] Adding child workspace to parent allowed directories: ${childSession.workspace.path}`,
-							);
-						} else {
-							console.warn(
-								`[Parent Session Resume] Could not find child session ${childSessionId} to add workspace to parent allowed directories`,
-							);
-						}
-
-						await this.postParentResumeAcknowledgment(parentSessionId, repo.id);
-
-						// Resume the parent session with the child's result
-						console.log(
-							`[Parent Session Resume] Resuming parent Claude session with child results`,
-						);
-						try {
-							await this.resumeClaudeSession(
-								parentSession,
-								repo,
-								parentSessionId,
-								agentSessionManager,
-								prompt,
-								"", // No attachment manifest for child results
-								false, // Not a new session
-								childWorkspaceDirs, // Add child workspace directories to parent's allowed directories
-							);
-							console.log(
-								`[Parent Session Resume] Successfully resumed parent session ${parentSessionId} with child results`,
-							);
-						} catch (error) {
-							console.error(
-								`[Parent Session Resume] Failed to resume parent session ${parentSessionId}:`,
-								error,
-							);
-							console.error(
-								`[Parent Session Resume] Error context - Parent issue: ${parentSession.issueId}, Repository: ${repo.name}`,
-							);
-						}
-					},
-				);
-				this.agentSessionManagers.set(repo.id, agentSessionManager);
-			}
-		}
-
-		// Group repositories by token to minimize NDJSON connections
-		const tokenToRepos = new Map<string, RepositoryConfig[]>();
-		for (const repo of this.repositories.values()) {
-			const repos = tokenToRepos.get(repo.linearToken) || [];
-			repos.push(repo);
-			tokenToRepos.set(repo.linearToken, repos);
-		}
-
-		// Create one NDJSON client per unique token using shared application server
-		for (const [token, repos] of tokenToRepos) {
-			if (!repos || repos.length === 0) continue;
-			const firstRepo = repos[0];
-			if (!firstRepo) continue;
-			const primaryRepoId = firstRepo.id;
-
-			// Determine which client to use based on environment variable
-			const useLinearDirectWebhooks =
-				process.env.LINEAR_DIRECT_WEBHOOKS?.toLowerCase().trim() === "true";
-
-			const clientConfig = {
-				proxyUrl: config.proxyUrl,
-				token: token,
-				name: repos.map((r) => r.name).join(", "), // Pass repository names
-				transport: "webhook" as const,
-				// Use shared application server instead of individual servers
-				useExternalWebhookServer: true,
-				externalWebhookServer: this.sharedApplicationServer,
-				webhookPort: serverPort, // All clients use same port
-				webhookPath: "/webhook",
-				webhookHost: serverHost,
-				...(config.baseUrl && { webhookBaseUrl: config.baseUrl }),
-				// Legacy fallback support
-				...(!config.baseUrl &&
-					config.webhookBaseUrl && { webhookBaseUrl: config.webhookBaseUrl }),
-				onConnect: () => this.handleConnect(primaryRepoId, repos),
-				onDisconnect: (reason?: string) =>
-					this.handleDisconnect(primaryRepoId, repos, reason),
-				onError: (error: Error) => this.handleError(error),
-			};
-
-			// Create the appropriate client based on configuration
-			const ndjsonClient = useLinearDirectWebhooks
-				? new LinearWebhookClient({
-						...clientConfig,
-						onWebhook: (payload) =>
-							this.handleWebhook(payload as unknown as LinearWebhook, repos),
-					})
-				: new NdjsonClient(clientConfig);
-
-			// Set up webhook handler for NdjsonClient (LinearWebhookClient uses onWebhook in constructor)
-			if (!useLinearDirectWebhooks) {
-				(ndjsonClient as NdjsonClient).on("webhook", (data) =>
-					this.handleWebhook(data as LinearWebhook, repos),
-				);
-			}
-
-			// Optional heartbeat logging (only for NdjsonClient)
-			if (process.env.DEBUG_EDGE === "true" && !useLinearDirectWebhooks) {
-				(ndjsonClient as NdjsonClient).on("heartbeat", () => {
-					console.log(
-						`❤️ Heartbeat received for token ending in ...${token.slice(-4)}`,
-					);
-				});
-			}
-
-			// Store with the first repo's ID as the key (for error messages)
-			// But also store the token mapping for lookup
-			this.ndjsonClients.set(primaryRepoId, ndjsonClient);
+		const result = spawnSync("codex", ["--version"], {
+			encoding: "utf-8",
+		});
+		if (result.error || result.status !== 0) {
+			const detail =
+				result.error?.message ||
+				result.stderr?.trim() ||
+				result.stdout?.trim() ||
+				`exit code ${result.status}`;
+			throw new Error(
+				`Codex runner is configured but the Codex CLI is not available (${detail}). Install the Codex CLI or adjust your configuration.`,
+			);
 		}
 	}
 
-	private debugLog(message: string, ...metadata: unknown[]): void {
-		if (process.env.DEBUG_EDGE?.toLowerCase() !== "true") {
+	private normalizePromptRuleConfig(config: unknown):
+		| {
+				labels: string[];
+				promptPath?: string;
+				version?: string;
+		  }
+		| undefined {
+		if (!config) {
+			return undefined;
+		}
+
+		if (Array.isArray(config)) {
+			const labels = config
+				.map((value) => (typeof value === "string" ? value : undefined))
+				.filter((value): value is string => Boolean(value));
+			return { labels };
+		}
+
+		if (typeof config === "object") {
+			const record = config as Record<string, unknown>;
+			const labels = Array.isArray(record.labels)
+				? (record.labels as unknown[]).filter(
+						(value): value is string => typeof value === "string",
+					)
+				: [];
+			const promptPath =
+				typeof record.promptPath === "string"
+					? (record.promptPath as string)
+					: undefined;
+			const version =
+				typeof record.version === "string"
+					? (record.version as string)
+					: undefined;
+			return {
+				labels,
+				promptPath,
+				version,
+			};
+		}
+
+		return undefined;
+	}
+
+	private promptConfigMatchesLabels(
+		configLabels: string[],
+		issueLabels: string[],
+	): boolean {
+		if (configLabels.length === 0) {
+			return true;
+		}
+
+		const normalizedConfig = configLabels.map((label) => label.toLowerCase());
+		return normalizedConfig.some((label) => issueLabels.includes(label));
+	}
+
+	private resolvePromptFilePath(promptPath?: string): string | undefined {
+		if (!promptPath) {
+			return undefined;
+		}
+		if (isAbsolute(promptPath)) {
+			return promptPath;
+		}
+		if (this.cyrusHome) {
+			return resolve(this.cyrusHome, promptPath);
+		}
+		return resolve(promptPath);
+	}
+
+	private async loadPromptTemplate(
+		promptType: SystemPromptType,
+		templatePath?: string,
+	): Promise<string | undefined> {
+		const targetPath = templatePath
+			? templatePath
+			: (() => {
+					const __filename = fileURLToPath(import.meta.url);
+					const __dirname = dirname(__filename);
+					return join(__dirname, "..", "prompts", `${promptType}.md`);
+				})();
+
+		try {
+			return await readFile(targetPath, "utf-8");
+		} catch (error) {
+			console.error(
+				`[EdgeWorker] Failed to load ${promptType} prompt template from ${targetPath}:`,
+				error,
+			);
+			return undefined;
+		}
+	}
+
+	private normalizeError(value: unknown, fallback = "Unknown error"): Error {
+		if (value instanceof Error) {
+			return value;
+		}
+		if (typeof value === "string") {
+			return new Error(value);
+		}
+		if (value && typeof value === "object") {
+			try {
+				return new Error(JSON.stringify(value));
+			} catch (_error) {
+				return new Error(fallback);
+			}
+		}
+		return new Error(fallback);
+	}
+
+	private deriveCodexPermissions(
+		repository: RepositoryConfig,
+		promptType?: SystemPromptType,
+		options?: {
+			allowedTools?: string[];
+			disallowedTools?: string[];
+		},
+	): CodexRunnerPermissions {
+		const allowedTools =
+			options?.allowedTools ?? this.buildAllowedTools(repository, promptType);
+		const disallowedTools =
+			options?.disallowedTools ??
+			this.buildDisallowedTools(repository, promptType);
+
+		const effectiveTools = allowedTools.filter(
+			(tool) => !disallowedTools.includes(tool),
+		);
+		const normalizedTools = effectiveTools.map((tool) =>
+			tool.trim().toLowerCase(),
+		);
+
+		const hasScopedBash = normalizedTools.some(
+			(tool) => tool.startsWith("bash(git:") || tool.startsWith("bash(gh:"),
+		);
+		const hasGeneralBash = normalizedTools.some(
+			(tool) =>
+				tool.startsWith("bash") &&
+				!tool.startsWith("bash(git:") &&
+				!tool.startsWith("bash(gh:"),
+		);
+		const hasWriteTool = normalizedTools.some(
+			(tool) =>
+				tool.startsWith("edit") ||
+				tool.includes("write") ||
+				tool.endsWith("edit"),
+		);
+
+		const profile: CodexPermissionProfile = hasGeneralBash
+			? "all"
+			: hasWriteTool || hasScopedBash
+				? "safe"
+				: "readOnly";
+
+		const mapping: Record<CodexPermissionProfile, CodexRunnerPermissions> = {
+			readOnly: {
+				profile: "readOnly",
+				sandbox: "read-only",
+				approvalPolicy: "never",
+				fullAuto: false,
+			},
+			safe: {
+				profile: "safe",
+				sandbox: "danger-full-access",
+				approvalPolicy: "never",
+				fullAuto: false,
+			},
+			all: {
+				profile: "all",
+				sandbox: "danger-full-access",
+				approvalPolicy: "never",
+				fullAuto: false,
+			},
+		};
+
+		this.debugLog(`[deriveCodexPermissions] Derived ${profile} profile`, {
+			repositoryId: repository.id,
+			promptType,
+			effectiveTools,
+		});
+
+		return mapping[profile];
+	}
+
+	private enqueueCodexLinearActivity(
+		sessionId: string,
+		task: () => Promise<void>,
+	): Promise<void> {
+		const previous =
+			this.codexActivityQueue.get(sessionId) ?? Promise.resolve();
+
+		const queuedTask = previous
+			.catch((error) => {
+				this.debugLog("[enqueueCodexLinearActivity] Previous task failed", {
+					sessionId,
+					error,
+				});
+			})
+			.then(() => task())
+			.catch((error) => {
+				this.debugLog("[enqueueCodexLinearActivity] Task failed", {
+					sessionId,
+					error,
+				});
+			})
+			.finally(() => {
+				if (this.codexActivityQueue.get(sessionId) === queuedTask) {
+					this.codexActivityQueue.delete(sessionId);
+				}
+			});
+
+		this.codexActivityQueue.set(sessionId, queuedTask);
+		return queuedTask;
+	}
+
+	private formatInlineErrorMessage(message: string): string {
+		const trimmed = (message ?? "").trim();
+		if (trimmed.length === 0) {
+			return "❌ Error encountered.";
+		}
+		return trimmed.startsWith("❌") ? trimmed : `❌ ${trimmed}`;
+	}
+
+	private normalizePromptType(
+		value: string | SystemPromptType | undefined,
+	): SystemPromptType | undefined {
+		if (!value) {
+			return undefined;
+		}
+		if (
+			value === "debugger" ||
+			value === "builder" ||
+			value === "scoper" ||
+			value === "orchestrator"
+		) {
+			return value;
+		}
+		return undefined;
+	}
+
+	private async postThought(
+		linearAgentActivitySessionId: string,
+		repositoryId: string,
+		body: string,
+	): Promise<void> {
+		const linearClient = this.linearClients.get(repositoryId);
+		if (!linearClient) {
+			this.debugLog("[postThought] No Linear client available", {
+				sessionId: linearAgentActivitySessionId,
+				repositoryId,
+			});
 			return;
 		}
-		const prefix = "[EdgeWorker][debug]";
-		if (metadata.length > 0) {
-			console.log(prefix, message, ...metadata);
-		} else {
-			console.log(prefix, message);
+
+		try {
+			await linearClient.createAgentActivity({
+				agentSessionId: linearAgentActivitySessionId,
+				content: {
+					type: "thought",
+					body,
+				},
+			});
+		} catch (error) {
+			this.debugLog("[postThought] Failed to post thought", {
+				sessionId: linearAgentActivitySessionId,
+				error,
+			});
+		}
+	}
+
+	private async postAction(
+		linearAgentActivitySessionId: string,
+		repositoryId: string,
+		action: string,
+		parameter?: string,
+	): Promise<void> {
+		const linearClient = this.linearClients.get(repositoryId);
+		if (!linearClient) {
+			this.debugLog("[postAction] No Linear client available", {
+				sessionId: linearAgentActivitySessionId,
+				repositoryId,
+			});
+			return;
+		}
+
+		try {
+			await linearClient.createAgentActivity({
+				agentSessionId: linearAgentActivitySessionId,
+				content: {
+					type: "action",
+					action,
+					parameter,
+				},
+			});
+		} catch (error) {
+			this.debugLog("[postAction] Failed to post action", {
+				sessionId: linearAgentActivitySessionId,
+				error,
+			});
+		}
+	}
+
+	private async postResponse(
+		linearAgentActivitySessionId: string,
+		repositoryId: string,
+		body: string,
+	): Promise<void> {
+		const linearClient = this.linearClients.get(repositoryId);
+		if (!linearClient) {
+			this.debugLog("[postResponse] No Linear client available", {
+				sessionId: linearAgentActivitySessionId,
+				repositoryId,
+			});
+			return;
+		}
+
+		try {
+			await linearClient.createAgentActivity({
+				agentSessionId: linearAgentActivitySessionId,
+				content: {
+					type: "response",
+					body,
+				},
+			});
+		} catch (error) {
+			this.debugLog("[postResponse] Failed to post response", {
+				sessionId: linearAgentActivitySessionId,
+				error,
+			});
+		}
+	}
+
+	private async postError(
+		linearAgentActivitySessionId: string,
+		repositoryId: string,
+		body: string,
+	): Promise<void> {
+		const linearClient = this.linearClients.get(repositoryId);
+		if (!linearClient) {
+			this.debugLog("[postError] No Linear client available", {
+				sessionId: linearAgentActivitySessionId,
+				repositoryId,
+			});
+			return;
+		}
+
+		try {
+			await linearClient.createAgentActivity({
+				agentSessionId: linearAgentActivitySessionId,
+				content: {
+					type: "error",
+					body,
+				},
+			});
+		} catch (error) {
+			this.debugLog("[postError] Failed to post error", {
+				sessionId: linearAgentActivitySessionId,
+				error,
+			});
+		}
+	}
+
+	private async markSessionComplete(
+		linearAgentActivitySessionId: string,
+		repositoryId: string,
+	): Promise<void> {
+		const linearClient = this.linearClients.get(repositoryId);
+		if (!linearClient) {
+			this.debugLog("[markSessionComplete] No Linear client available", {
+				sessionId: linearAgentActivitySessionId,
+				repositoryId,
+			});
+			return;
+		}
+
+		if (!this.config.features?.postStatusActivities) {
+			this.debugLog("[markSessionComplete] Status activity posting disabled", {
+				sessionId: linearAgentActivitySessionId,
+				repositoryId,
+			});
+			return;
+		}
+
+		try {
+			await linearClient.createAgentActivity({
+				agentSessionId: linearAgentActivitySessionId,
+				content: {
+					type: "status",
+					status: "completed",
+				},
+			});
+		} catch (error) {
+			this.debugLog("[markSessionComplete] Failed to post completion", {
+				sessionId: linearAgentActivitySessionId,
+				error,
+			});
+		}
+	}
+
+	private async startNonClaudeRunner(
+		options: StartNonClaudeRunnerOptions,
+	): Promise<void> {
+		const {
+			selection,
+			repository,
+			prompt,
+			workspacePath,
+			linearAgentActivitySessionId,
+			issueId,
+			allowedTools,
+			disallowedTools,
+			promptType,
+			isFollowUp,
+		} = options;
+
+		if (selection.type !== "codex") {
+			this.debugLog(
+				"[startNonClaudeRunner] Ignoring request for non-codex selection",
+				{
+					sessionId: linearAgentActivitySessionId,
+					type: selection.type,
+				},
+			);
+			return;
+		}
+
+		this.debugLog("[startNonClaudeRunner] Starting codex runner", {
+			sessionId: linearAgentActivitySessionId,
+			model: selection.model,
+			isFollowUp,
+		});
+
+		const scheduleStateSave = (): void => {
+			void this.savePersistedState().catch((error) => {
+				this.debugLog("[startNonClaudeRunner] Failed to persist state", {
+					sessionId: linearAgentActivitySessionId,
+					error,
+				});
+			});
+		};
+
+		this.stopRequestedSessions.delete(linearAgentActivitySessionId);
+		this.finalizedNonClaudeSessions.delete(linearAgentActivitySessionId);
+
+		const permissions =
+			selection.codexPermissions ??
+			this.deriveCodexPermissions(repository, promptType, {
+				allowedTools,
+				disallowedTools,
+			});
+
+		const resumeSessionId =
+			selection.resumeSessionId ||
+			this.codexSessionCache.get(linearAgentActivitySessionId);
+
+		const updatedSelection: SessionRunnerMetadata = {
+			...selection,
+			issueId: selection.issueId || issueId || "",
+			resumeSessionId: resumeSessionId ?? selection.resumeSessionId,
+			promptType,
+			codexPermissions: permissions,
+		};
+
+		this.sessionRunnerSelections.set(
+			linearAgentActivitySessionId,
+			updatedSelection,
+		);
+
+		scheduleStateSave();
+
+		const existingRunner = this.nonClaudeRunners.get(
+			linearAgentActivitySessionId,
+		);
+		if (existingRunner) {
+			await this.safeStopRunner(linearAgentActivitySessionId, existingRunner);
+		}
+
+		const runnerConfig = {
+			type: "codex" as const,
+			cwd: workspacePath,
+			prompt,
+			model: updatedSelection.model,
+			sandbox: permissions?.sandbox ?? this.config.cliDefaults?.codex?.sandbox,
+			approvalPolicy:
+				permissions?.approvalPolicy ??
+				this.config.cliDefaults?.codex?.approvalPolicy,
+			fullAuto:
+				permissions?.fullAuto ??
+				this.config.cliDefaults?.codex?.fullAuto ??
+				false,
+			resumeSessionId: resumeSessionId,
+		};
+
+		const runner = this.runnerFactory.create(runnerConfig);
+		this.nonClaudeRunners.set(linearAgentActivitySessionId, runner);
+
+		const handleRunnerEvent = (event: RunnerEvent): void => {
+			switch (event.kind) {
+				case "thought": {
+					const text = event.text?.trim();
+					if (!text) return;
+					void this.enqueueCodexLinearActivity(
+						linearAgentActivitySessionId,
+						() =>
+							this.postThought(
+								linearAgentActivitySessionId,
+								repository.id,
+								text,
+							),
+					);
+					break;
+				}
+				case "action": {
+					const actionTitle = event.icon
+						? `${event.icon} ${event.name}`
+						: `🛠️ ${event.name}`;
+					void this.enqueueCodexLinearActivity(
+						linearAgentActivitySessionId,
+						() =>
+							this.postAction(
+								linearAgentActivitySessionId,
+								repository.id,
+								actionTitle,
+								event.detail,
+							),
+					);
+					break;
+				}
+				case "response": {
+					const text = event.text?.trim();
+					if (!text) return;
+					void this.enqueueCodexLinearActivity(
+						linearAgentActivitySessionId,
+						() =>
+							this.postResponse(
+								linearAgentActivitySessionId,
+								repository.id,
+								text,
+							),
+					);
+					break;
+				}
+				case "final": {
+					const text = event.text?.trim();
+					if (text) {
+						void this.enqueueCodexLinearActivity(
+							linearAgentActivitySessionId,
+							() =>
+								this.postResponse(
+									linearAgentActivitySessionId,
+									repository.id,
+									text,
+								),
+						);
+					}
+					this.finalizedNonClaudeSessions.add(linearAgentActivitySessionId);
+					this.nonClaudeRunners.delete(linearAgentActivitySessionId);
+					this.stopRequestedSessions.delete(linearAgentActivitySessionId);
+					scheduleStateSave();
+					void this.markSessionComplete(
+						linearAgentActivitySessionId,
+						repository.id,
+					);
+					break;
+				}
+				case "session": {
+					if (event.id) {
+						this.codexSessionCache.set(linearAgentActivitySessionId, event.id);
+						const currentSelection =
+							this.sessionRunnerSelections.get(linearAgentActivitySessionId) ??
+							updatedSelection;
+						this.sessionRunnerSelections.set(linearAgentActivitySessionId, {
+							...currentSelection,
+							resumeSessionId: event.id,
+						});
+						scheduleStateSave();
+					}
+					break;
+				}
+				case "error": {
+					const normalized = this.normalizeError(event.error);
+					const cause =
+						normalized instanceof Error
+							? (normalized as Error & { cause?: unknown }).cause
+							: undefined;
+					const causeType =
+						cause && typeof cause === "object"
+							? (cause as { type?: string }).type
+							: undefined;
+					const isRecoverable =
+						causeType === "item.failed" || causeType === "item.completed";
+
+					if (this.stopRequestedSessions.has(linearAgentActivitySessionId)) {
+						this.debugLog(
+							"[startNonClaudeRunner] Suppressing error after stop request",
+							{
+								sessionId: linearAgentActivitySessionId,
+								message: normalized.message,
+							},
+						);
+						return;
+					}
+
+					if (isRecoverable) {
+						const message = this.formatInlineErrorMessage(normalized.message);
+						void this.enqueueCodexLinearActivity(
+							linearAgentActivitySessionId,
+							() =>
+								this.postThought(
+									linearAgentActivitySessionId,
+									repository.id,
+									message,
+								),
+						);
+					} else {
+						this.finalizedNonClaudeSessions.add(linearAgentActivitySessionId);
+						this.nonClaudeRunners.delete(linearAgentActivitySessionId);
+						void this.enqueueCodexLinearActivity(
+							linearAgentActivitySessionId,
+							() =>
+								this.postError(
+									linearAgentActivitySessionId,
+									repository.id,
+									normalized.message,
+								),
+						);
+						void this.safeStopRunner(linearAgentActivitySessionId, runner)
+							.then(() => this.savePersistedState())
+							.catch((stopError) => {
+								this.debugLog(
+									"[startNonClaudeRunner] Failed during fatal stop",
+									{
+										sessionId: linearAgentActivitySessionId,
+										error: stopError,
+									},
+								);
+							});
+					}
+					break;
+				}
+				case "log": {
+					this.debugLog("[startNonClaudeRunner] Runner log event", {
+						sessionId: linearAgentActivitySessionId,
+						message: event.text,
+					});
+					break;
+				}
+				default:
+					this.debugLog("[startNonClaudeRunner] Unhandled runner event", {
+						sessionId: linearAgentActivitySessionId,
+						event,
+					});
+			}
+		};
+
+		try {
+			const result = await runner.start(handleRunnerEvent);
+			if (result.sessionId) {
+				this.codexSessionCache.set(
+					linearAgentActivitySessionId,
+					result.sessionId,
+				);
+				const currentSelection =
+					this.sessionRunnerSelections.get(linearAgentActivitySessionId) ??
+					updatedSelection;
+				this.sessionRunnerSelections.set(linearAgentActivitySessionId, {
+					...currentSelection,
+					resumeSessionId: result.sessionId,
+				});
+				await this.savePersistedState();
+			}
+		} catch (error) {
+			const normalized = this.normalizeError(error);
+			this.finalizedNonClaudeSessions.add(linearAgentActivitySessionId);
+			this.nonClaudeRunners.delete(linearAgentActivitySessionId);
+			await this.enqueueCodexLinearActivity(linearAgentActivitySessionId, () =>
+				this.postError(
+					linearAgentActivitySessionId,
+					repository.id,
+					normalized.message,
+				),
+			);
+			await this.safeStopRunner(linearAgentActivitySessionId, runner);
+			await this.savePersistedState();
 		}
 	}
 
@@ -483,6 +1519,12 @@ export class EdgeWorker extends EventEmitter {
 	async start(): Promise<void> {
 		// Load persisted state for each repository
 		await this.loadPersistedState();
+		this.validateRunnerAvailability();
+
+		// Start config file watcher if configPath is provided
+		if (this.configPath) {
+			this.startConfigWatcher();
+		}
 
 		// Start shared application server first
 		await this.sharedApplicationServer.start();
@@ -560,6 +1602,13 @@ export class EdgeWorker extends EventEmitter {
 	 * Stop the edge worker
 	 */
 	async stop(): Promise<void> {
+		// Stop config file watcher
+		if (this.configWatcher) {
+			await this.configWatcher.close();
+			this.configWatcher = undefined;
+			console.log("✅ Config file watcher stopped");
+		}
+
 		try {
 			await this.savePersistedState();
 			console.log("✅ EdgeWorker state saved successfully");
@@ -594,6 +1643,638 @@ export class EdgeWorker extends EventEmitter {
 
 		// Stop shared application server
 		await this.sharedApplicationServer.stop();
+	}
+
+	/**
+	 * Set the config file path for dynamic reloading
+	 */
+	setConfigPath(configPath: string): void {
+		this.configPath = configPath;
+	}
+
+	/**
+	 * Get fresh list of repositories for a given Linear token
+	 * This ensures webhook handlers always work with current repository state
+	 */
+	private getRepositoriesForToken(token: string): RepositoryConfig[] {
+		const repoIds = this.tokenToRepoIds.get(token) || [];
+		const repos: RepositoryConfig[] = [];
+		for (const repoId of repoIds) {
+			const repo = this.repositories.get(repoId);
+			if (repo) {
+				repos.push(repo);
+			}
+		}
+		return repos;
+	}
+
+	/**
+	 * Handle resuming a parent session when a child session completes
+	 * This is the core logic used by the resume parent session callback
+	 * Extracted to reduce duplication between constructor and addNewRepositories
+	 */
+	private async handleResumeParentSession(
+		parentSessionId: string,
+		prompt: string,
+		childSessionId: string,
+		repo: RepositoryConfig,
+		agentSessionManager: AgentSessionManager,
+	): Promise<void> {
+		console.log(
+			`[Parent Session Resume] Child session completed, resuming parent session ${parentSessionId}`,
+		);
+
+		// Get the parent session and repository
+		console.log(
+			`[Parent Session Resume] Retrieving parent session ${parentSessionId} from agent session manager`,
+		);
+		const parentSession = agentSessionManager.getSession(parentSessionId);
+		if (!parentSession) {
+			console.error(
+				`[Parent Session Resume] Parent session ${parentSessionId} not found in agent session manager`,
+			);
+			return;
+		}
+
+		console.log(
+			`[Parent Session Resume] Found parent session - Issue: ${parentSession.issueId}, Workspace: ${parentSession.workspace.path}`,
+		);
+
+		// Get the child session to access its workspace path
+		const childSession = agentSessionManager.getSession(childSessionId);
+		const childWorkspaceDirs: string[] = [];
+		if (childSession) {
+			childWorkspaceDirs.push(childSession.workspace.path);
+			console.log(
+				`[Parent Session Resume] Adding child workspace to parent allowed directories: ${childSession.workspace.path}`,
+			);
+		} else {
+			console.warn(
+				`[Parent Session Resume] Could not find child session ${childSessionId} to add workspace to parent allowed directories`,
+			);
+		}
+
+		await this.postParentResumeAcknowledgment(parentSessionId, repo.id);
+
+		// Post thought to Linear showing child result receipt
+		const linearClient = this.linearClients.get(repo.id);
+		if (linearClient && childSession) {
+			const childIssueIdentifier =
+				childSession.issue?.identifier || childSession.issueId;
+			const resultThought = `Received result from sub-issue ${childIssueIdentifier}:\n\n---\n\n${prompt}\n\n---`;
+
+			try {
+				const result = await linearClient.createAgentActivity({
+					agentSessionId: parentSessionId,
+					content: {
+						type: "thought",
+						body: resultThought,
+					},
+				});
+
+				if (result.success) {
+					console.log(
+						`[Parent Session Resume] Posted child result receipt thought for parent session ${parentSessionId}`,
+					);
+				} else {
+					console.error(
+						`[Parent Session Resume] Failed to post child result receipt thought:`,
+						result,
+					);
+				}
+			} catch (error) {
+				console.error(
+					`[Parent Session Resume] Error posting child result receipt thought:`,
+					error,
+				);
+			}
+		}
+
+		// Use centralized streaming check and routing logic
+		console.log(
+			`[Parent Session Resume] Handling child result for parent session ${parentSessionId}`,
+		);
+		try {
+			await this.handlePromptWithStreamingCheck(
+				parentSession,
+				repo,
+				parentSessionId,
+				agentSessionManager,
+				prompt,
+				"", // No attachment manifest for child results
+				false, // Not a new session
+				childWorkspaceDirs, // Add child workspace directories to parent's allowed directories
+				"parent resume from child",
+			);
+			console.log(
+				`[Parent Session Resume] Successfully handled child result for parent session ${parentSessionId}`,
+			);
+		} catch (error) {
+			console.error(
+				`[Parent Session Resume] Failed to resume parent session ${parentSessionId}:`,
+				error,
+			);
+			console.error(
+				`[Parent Session Resume] Error context - Parent issue: ${parentSession.issueId}, Repository: ${repo.name}`,
+			);
+		}
+	}
+
+	/**
+	 * Start watching config file for changes
+	 */
+	private startConfigWatcher(): void {
+		if (!this.configPath) {
+			console.warn("⚠️  No config path set, skipping config file watcher");
+			return;
+		}
+
+		console.log(`👀 Watching config file for changes: ${this.configPath}`);
+
+		this.configWatcher = chokidarWatch(this.configPath, {
+			persistent: true,
+			ignoreInitial: true,
+			awaitWriteFinish: {
+				stabilityThreshold: 500,
+				pollInterval: 100,
+			},
+		});
+
+		this.configWatcher.on("change", async () => {
+			console.log("🔄 Config file changed, reloading...");
+			await this.handleConfigChange();
+		});
+
+		this.configWatcher.on("error", (error: unknown) => {
+			console.error("❌ Config watcher error:", error);
+		});
+	}
+
+	/**
+	 * Handle configuration file changes
+	 */
+	private async handleConfigChange(): Promise<void> {
+		try {
+			const newConfig = await this.loadConfigSafely();
+			if (!newConfig) {
+				return;
+			}
+
+			const changes = this.detectRepositoryChanges(newConfig);
+
+			if (
+				changes.added.length === 0 &&
+				changes.modified.length === 0 &&
+				changes.removed.length === 0
+			) {
+				console.log("ℹ️  No repository changes detected");
+				return;
+			}
+
+			console.log(
+				`📊 Repository changes detected: ${changes.added.length} added, ${changes.modified.length} modified, ${changes.removed.length} removed`,
+			);
+
+			// Apply changes incrementally
+			await this.removeDeletedRepositories(changes.removed);
+			await this.updateModifiedRepositories(changes.modified);
+			await this.addNewRepositories(changes.added);
+
+			// Update config reference
+			this.config = newConfig;
+
+			console.log("✅ Configuration reloaded successfully");
+		} catch (error) {
+			console.error("❌ Failed to reload configuration:", error);
+		}
+	}
+
+	/**
+	 * Safely load configuration from file with validation
+	 */
+	private async loadConfigSafely(): Promise<EdgeWorkerConfig | null> {
+		try {
+			if (!this.configPath) {
+				console.error("❌ No config path set");
+				return null;
+			}
+
+			const configContent = await readFile(this.configPath, "utf-8");
+			const parsedConfig = JSON.parse(configContent);
+
+			// Merge with current EdgeWorker config structure
+			const newConfig: EdgeWorkerConfig = {
+				...this.config,
+				repositories: parsedConfig.repositories || [],
+				ngrokAuthToken:
+					parsedConfig.ngrokAuthToken || this.config.ngrokAuthToken,
+				defaultModel: parsedConfig.defaultModel || this.config.defaultModel,
+				defaultFallbackModel:
+					parsedConfig.defaultFallbackModel || this.config.defaultFallbackModel,
+				defaultAllowedTools:
+					parsedConfig.defaultAllowedTools || this.config.defaultAllowedTools,
+				defaultDisallowedTools:
+					parsedConfig.defaultDisallowedTools ||
+					this.config.defaultDisallowedTools,
+			};
+
+			// Basic validation
+			if (!Array.isArray(newConfig.repositories)) {
+				console.error("❌ Invalid config: repositories must be an array");
+				return null;
+			}
+
+			// Validate each repository has required fields
+			for (const repo of newConfig.repositories) {
+				if (
+					!repo.id ||
+					!repo.name ||
+					!repo.repositoryPath ||
+					!repo.baseBranch
+				) {
+					console.error(
+						`❌ Invalid repository config: missing required fields (id, name, repositoryPath, baseBranch)`,
+						repo,
+					);
+					return null;
+				}
+			}
+
+			return newConfig;
+		} catch (error) {
+			console.error("❌ Failed to load config file:", error);
+			return null;
+		}
+	}
+
+	/**
+	 * Detect changes between current and new repository configurations
+	 */
+	private detectRepositoryChanges(newConfig: EdgeWorkerConfig): {
+		added: RepositoryConfig[];
+		modified: RepositoryConfig[];
+		removed: RepositoryConfig[];
+	} {
+		const currentRepos = new Map(this.repositories);
+		const newRepos = new Map(newConfig.repositories.map((r) => [r.id, r]));
+
+		const added: RepositoryConfig[] = [];
+		const modified: RepositoryConfig[] = [];
+		const removed: RepositoryConfig[] = [];
+
+		// Find added and modified repositories
+		for (const [id, repo] of newRepos) {
+			if (!currentRepos.has(id)) {
+				added.push(repo);
+			} else {
+				const currentRepo = currentRepos.get(id);
+				if (currentRepo && !this.deepEqual(currentRepo, repo)) {
+					modified.push(repo);
+				}
+			}
+		}
+
+		// Find removed repositories
+		for (const [id, repo] of currentRepos) {
+			if (!newRepos.has(id)) {
+				removed.push(repo);
+			}
+		}
+
+		return { added, modified, removed };
+	}
+
+	/**
+	 * Deep equality check for repository configs
+	 */
+	private deepEqual(obj1: any, obj2: any): boolean {
+		return JSON.stringify(obj1) === JSON.stringify(obj2);
+	}
+
+	/**
+	 * Add new repositories to the running EdgeWorker
+	 */
+	private async addNewRepositories(repos: RepositoryConfig[]): Promise<void> {
+		for (const repo of repos) {
+			if (repo.isActive === false) {
+				console.log(`⏭️  Skipping inactive repository: ${repo.name}`);
+				continue;
+			}
+
+			try {
+				console.log(`➕ Adding repository: ${repo.name} (${repo.id})`);
+
+				// Add to internal map
+				this.repositories.set(repo.id, repo);
+
+				// Create Linear client
+				const linearClient = new LinearClient({
+					accessToken: repo.linearToken,
+				});
+				this.linearClients.set(repo.id, linearClient);
+
+				// Create AgentSessionManager with same pattern as constructor
+				const agentSessionManager = new AgentSessionManager(
+					linearClient,
+					(childSessionId: string) => {
+						return this.childToParentAgentSession.get(childSessionId);
+					},
+					async (parentSessionId, prompt, childSessionId) => {
+						await this.handleResumeParentSession(
+							parentSessionId,
+							prompt,
+							childSessionId,
+							repo,
+							agentSessionManager,
+						);
+					},
+					undefined, // No resumeNextSubroutine callback for dynamically added repos
+					this.procedureRouter,
+					this.sharedApplicationServer,
+				);
+				this.agentSessionManagers.set(repo.id, agentSessionManager);
+
+				// Update token-to-repo mapping
+				const repoIds = this.tokenToRepoIds.get(repo.linearToken) || [];
+				if (!repoIds.includes(repo.id)) {
+					repoIds.push(repo.id);
+				}
+				this.tokenToRepoIds.set(repo.linearToken, repoIds);
+
+				// Set up webhook listener
+				await this.setupWebhookListener(repo);
+
+				console.log(`✅ Repository added successfully: ${repo.name}`);
+			} catch (error) {
+				console.error(`❌ Failed to add repository ${repo.name}:`, error);
+			}
+		}
+	}
+
+	/**
+	 * Update existing repositories
+	 */
+	private async updateModifiedRepositories(
+		repos: RepositoryConfig[],
+	): Promise<void> {
+		for (const repo of repos) {
+			try {
+				const oldRepo = this.repositories.get(repo.id);
+				if (!oldRepo) {
+					console.warn(
+						`⚠️  Repository ${repo.id} not found for update, skipping`,
+					);
+					continue;
+				}
+
+				console.log(`🔄 Updating repository: ${repo.name} (${repo.id})`);
+
+				// Update stored config
+				this.repositories.set(repo.id, repo);
+
+				// If token changed, recreate Linear client
+				if (oldRepo.linearToken !== repo.linearToken) {
+					console.log(`  🔑 Token changed, recreating Linear client`);
+					const linearClient = new LinearClient({
+						accessToken: repo.linearToken,
+					});
+					this.linearClients.set(repo.id, linearClient);
+
+					// Update token mapping
+					const oldRepoIds = this.tokenToRepoIds.get(oldRepo.linearToken) || [];
+					const filteredOldIds = oldRepoIds.filter((id) => id !== repo.id);
+					if (filteredOldIds.length > 0) {
+						this.tokenToRepoIds.set(oldRepo.linearToken, filteredOldIds);
+					} else {
+						this.tokenToRepoIds.delete(oldRepo.linearToken);
+					}
+
+					const newRepoIds = this.tokenToRepoIds.get(repo.linearToken) || [];
+					if (!newRepoIds.includes(repo.id)) {
+						newRepoIds.push(repo.id);
+					}
+					this.tokenToRepoIds.set(repo.linearToken, newRepoIds);
+
+					// Reconnect webhook if needed
+					await this.reconnectWebhook(oldRepo, repo);
+				}
+
+				// If active status changed
+				if (oldRepo.isActive !== repo.isActive) {
+					if (repo.isActive === false) {
+						console.log(
+							`  ⏸️  Repository set to inactive - existing sessions will continue`,
+						);
+					} else {
+						console.log(`  ▶️  Repository reactivated`);
+						await this.setupWebhookListener(repo);
+					}
+				}
+
+				console.log(`✅ Repository updated successfully: ${repo.name}`);
+			} catch (error) {
+				console.error(`❌ Failed to update repository ${repo.name}:`, error);
+			}
+		}
+	}
+
+	/**
+	 * Remove deleted repositories
+	 */
+	private async removeDeletedRepositories(
+		repos: RepositoryConfig[],
+	): Promise<void> {
+		for (const repo of repos) {
+			try {
+				console.log(`🗑️  Removing repository: ${repo.name} (${repo.id})`);
+
+				// Check for active sessions
+				const manager = this.agentSessionManagers.get(repo.id);
+				const activeSessions = manager?.getActiveSessions() || [];
+
+				if (activeSessions.length > 0) {
+					console.warn(
+						`  ⚠️  Repository has ${activeSessions.length} active sessions - stopping them`,
+					);
+
+					// Stop all active sessions and notify Linear
+					for (const session of activeSessions) {
+						try {
+							console.log(`  🛑 Stopping session for issue ${session.issueId}`);
+
+							// Get the Claude runner for this session
+							const runner = manager?.getClaudeRunner(
+								session.linearAgentActivitySessionId,
+							);
+							if (runner) {
+								// Stop the Claude process
+								runner.stop();
+								console.log(
+									`  ✅ Stopped Claude runner for session ${session.linearAgentActivitySessionId}`,
+								);
+							}
+
+							// Post cancellation message to Linear
+							const linearClient = this.linearClients.get(repo.id);
+							if (linearClient) {
+								await linearClient.createAgentActivity({
+									agentSessionId: session.linearAgentActivitySessionId,
+									content: {
+										type: "response",
+										body: `**Repository Removed from Configuration**\n\nThis repository (\`${repo.name}\`) has been removed from the Cyrus configuration. All active sessions for this repository have been stopped.\n\nIf you need to continue working on this issue, please contact your administrator to restore the repository configuration.`,
+									},
+								});
+								console.log(
+									`  📤 Posted cancellation message to Linear for issue ${session.issueId}`,
+								);
+							}
+						} catch (error) {
+							console.error(
+								`  ❌ Failed to stop session ${session.linearAgentActivitySessionId}:`,
+								error,
+							);
+						}
+					}
+				}
+
+				// Remove repository from all maps
+				this.repositories.delete(repo.id);
+				this.linearClients.delete(repo.id);
+				this.agentSessionManagers.delete(repo.id);
+
+				// Update token mapping
+				const repoIds = this.tokenToRepoIds.get(repo.linearToken) || [];
+				const filteredIds = repoIds.filter((id) => id !== repo.id);
+				if (filteredIds.length > 0) {
+					this.tokenToRepoIds.set(repo.linearToken, filteredIds);
+				} else {
+					this.tokenToRepoIds.delete(repo.linearToken);
+				}
+
+				// Clean up webhook listener if no other repos use the same token
+				await this.cleanupWebhookIfUnused(repo);
+
+				console.log(`✅ Repository removed successfully: ${repo.name}`);
+			} catch (error) {
+				console.error(`❌ Failed to remove repository ${repo.name}:`, error);
+			}
+		}
+	}
+
+	/**
+	 * Set up webhook listener for a repository
+	 */
+	private async setupWebhookListener(repo: RepositoryConfig): Promise<void> {
+		// Check if we already have a client for this token
+		const existingRepoIds = this.tokenToRepoIds.get(repo.linearToken) || [];
+		const existingClient =
+			existingRepoIds.length > 0
+				? this.ndjsonClients.get(existingRepoIds[0] || "")
+				: null;
+
+		if (existingClient) {
+			console.log(
+				`  ℹ️  Reusing existing webhook connection for token ...${repo.linearToken.slice(-4)}`,
+			);
+			return;
+		}
+
+		// Create new NDJSON client for this token
+		const serverPort =
+			this.config.serverPort || this.config.webhookPort || 3456;
+		const serverHost = this.config.serverHost || "localhost";
+		const useLinearDirectWebhooks =
+			process.env.LINEAR_DIRECT_WEBHOOKS?.toLowerCase().trim() === "true";
+
+		const clientConfig = {
+			proxyUrl: this.config.proxyUrl,
+			token: repo.linearToken,
+			name: repo.name,
+			transport: "webhook" as const,
+			useExternalWebhookServer: true,
+			externalWebhookServer: this.sharedApplicationServer,
+			webhookPort: serverPort,
+			webhookPath: "/webhook",
+			webhookHost: serverHost,
+			...(this.config.baseUrl && { webhookBaseUrl: this.config.baseUrl }),
+			...(!this.config.baseUrl &&
+				this.config.webhookBaseUrl && {
+					webhookBaseUrl: this.config.webhookBaseUrl,
+				}),
+			onConnect: () => this.handleConnect(repo.id, [repo]),
+			onDisconnect: (reason?: string) =>
+				this.handleDisconnect(repo.id, [repo], reason),
+			onError: (error: Error) => this.handleError(error),
+		};
+
+		const ndjsonClient = useLinearDirectWebhooks
+			? new LinearWebhookClient({
+					...clientConfig,
+					onWebhook: (payload: any) => {
+						// Get fresh repositories for this token to avoid stale closures
+						const freshRepos = this.getRepositoriesForToken(repo.linearToken);
+						this.handleWebhook(payload as unknown as LinearWebhook, freshRepos);
+					},
+				})
+			: new NdjsonClient(clientConfig);
+
+		if (!useLinearDirectWebhooks) {
+			(ndjsonClient as NdjsonClient).on("webhook", (data) => {
+				// Get fresh repositories for this token to avoid stale closures
+				const freshRepos = this.getRepositoriesForToken(repo.linearToken);
+				this.handleWebhook(data as LinearWebhook, freshRepos);
+			});
+		}
+
+		this.ndjsonClients.set(repo.id, ndjsonClient);
+
+		// Connect the client
+		try {
+			await ndjsonClient.connect();
+			console.log(`  ✅ Webhook listener connected for ${repo.name}`);
+		} catch (error) {
+			console.error(`  ❌ Failed to connect webhook listener:`, error);
+		}
+	}
+
+	/**
+	 * Reconnect webhook when token changes
+	 */
+	private async reconnectWebhook(
+		oldRepo: RepositoryConfig,
+		newRepo: RepositoryConfig,
+	): Promise<void> {
+		console.log(`  🔌 Reconnecting webhook due to token change`);
+
+		// Disconnect old client if no other repos use it
+		await this.cleanupWebhookIfUnused(oldRepo);
+
+		// Set up new connection
+		await this.setupWebhookListener(newRepo);
+	}
+
+	/**
+	 * Clean up webhook listener if no other repositories use the token
+	 */
+	private async cleanupWebhookIfUnused(repo: RepositoryConfig): Promise<void> {
+		const repoIds = this.tokenToRepoIds.get(repo.linearToken) || [];
+		const otherRepos = repoIds.filter((id) => id !== repo.id);
+
+		if (otherRepos.length === 0) {
+			// No other repos use this token, safe to disconnect
+			const client = this.ndjsonClients.get(repo.id);
+			if (client) {
+				console.log(
+					`  🔌 Disconnecting webhook for token ...${repo.linearToken.slice(-4)}`,
+				);
+				client.disconnect();
+				this.ndjsonClients.delete(repo.id);
+			}
+		} else {
+			console.log(
+				`  ℹ️  Token still used by ${otherRepos.length} other repository(ies), keeping connection`,
+			);
+		}
 	}
 
 	/**
@@ -998,9 +2679,29 @@ export class EdgeWorker extends EventEmitter {
 		console.log(
 			`[EdgeWorker] Handling agent session created: ${webhook.agentSession.issue.identifier}`,
 		);
-		const { agentSession } = webhook;
+		const { agentSession, guidance } = webhook;
 		const linearAgentActivitySessionId = agentSession.id;
 		const { issue } = agentSession;
+
+		// Log guidance if present
+		if (guidance && guidance.length > 0) {
+			console.log(
+				`[EdgeWorker] Agent guidance received: ${guidance.length} rule(s)`,
+			);
+			for (const rule of guidance) {
+				let origin = "Unknown";
+				if (rule.origin) {
+					if (rule.origin.__typename === "TeamOriginWebhookPayload") {
+						origin = `Team: ${rule.origin.team.displayName}`;
+					} else {
+						origin = "Organization";
+					}
+				}
+				console.log(
+					`[EdgeWorker]   - ${origin}: ${rule.body.substring(0, 100)}...`,
+				);
+			}
+		}
 
 		const commentBody = agentSession.comment?.body;
 		// HACK: This is required since the comment body is always populated, thus there is no other way to differentiate between the two trigger events
@@ -1046,183 +2747,263 @@ export class EdgeWorker extends EventEmitter {
 			allowedDirectories,
 		} = sessionData;
 
-		// Fetch labels (needed for both model selection and system prompt determination)
+		// Initialize procedure metadata using intelligent routing
+		if (!session.metadata) {
+			session.metadata = {};
+		}
+
+		// Post ephemeral "Routing..." thought
+		if (typeof agentSessionManager.postRoutingThought === "function") {
+			await agentSessionManager.postRoutingThought(
+				linearAgentActivitySessionId,
+			);
+		}
+
+		// Fetch labels early (needed for label override check)
 		const labels = await this.fetchIssueLabels(fullIssue);
-		this.debugLog(`[handleAgentSessionCreated] Repository runner configured`, {
-			repositoryId: repository.id,
-			configuredRunner: repository.runner ?? "(unset)",
+		// Check for label overrides BEFORE AI routing
+		const debuggerConfig = repository.labelPrompts?.debugger;
+		const debuggerLabels = Array.isArray(debuggerConfig)
+			? debuggerConfig
+			: debuggerConfig?.labels;
+		const hasDebuggerLabel = debuggerLabels?.some((label) =>
+			labels.includes(label),
+		);
+
+		const orchestratorConfig = repository.labelPrompts?.orchestrator;
+		const orchestratorLabels = Array.isArray(orchestratorConfig)
+			? orchestratorConfig
+			: orchestratorConfig?.labels;
+		const hasOrchestratorLabel = orchestratorLabels?.some((label) =>
+			labels.includes(label),
+		);
+
+		let finalProcedure: ProcedureDefinition;
+		let finalClassification: RequestClassification;
+
+		// If labels indicate a specific procedure, use that instead of AI routing
+		if (hasDebuggerLabel) {
+			const debuggerProcedure =
+				this.procedureRouter.getProcedure("debugger-full");
+			if (!debuggerProcedure) {
+				throw new Error("debugger-full procedure not found in registry");
+			}
+			finalProcedure = debuggerProcedure;
+			finalClassification = "debugger";
+			console.log(
+				`[EdgeWorker] Using debugger-full procedure due to debugger label (skipping AI routing)`,
+			);
+		} else if (hasOrchestratorLabel) {
+			const orchestratorProcedure =
+				this.procedureRouter.getProcedure("orchestrator-full");
+			if (!orchestratorProcedure) {
+				throw new Error("orchestrator-full procedure not found in registry");
+			}
+			finalProcedure = orchestratorProcedure;
+			finalClassification = "orchestrator";
+			console.log(
+				`[EdgeWorker] Using orchestrator-full procedure due to orchestrator label (skipping AI routing)`,
+			);
+		} else {
+			// No label override - use AI routing
+			const issueDescription =
+				`${issue.title}\n\n${fullIssue.description || ""}`.trim();
+			const routingDecision =
+				await this.procedureRouter.determineRoutine(issueDescription);
+			finalProcedure = routingDecision.procedure;
+			finalClassification = routingDecision.classification;
+
+			// Log AI routing decision
+			console.log(
+				`[EdgeWorker] AI routing decision for ${linearAgentActivitySessionId}:`,
+			);
+			console.log(`  Classification: ${routingDecision.classification}`);
+			console.log(`  Procedure: ${finalProcedure.name}`);
+			console.log(`  Reasoning: ${routingDecision.reasoning}`);
+		}
+
+		const runnerSelection = this.resolveRunnerSelection({
+			labels,
+			repository,
+			procedureName: finalProcedure.name,
+			classification: finalClassification,
 		});
 
-		// Only determine system prompt for delegation (not mentions) or when /label-based-prompt is requested
-		let systemPrompt: string | undefined;
-		let systemPromptVersion: string | undefined;
-		let promptType: string | undefined;
+		// Initialize procedure metadata in session with final decision
+		this.procedureRouter.initializeProcedureMetadata(session, finalProcedure);
 
-		if (!isMentionTriggered || isLabelBasedPromptRequested) {
-			// Determine system prompt based on labels (delegation case or /label-based-prompt command)
-			const systemPromptResult = await this.determineSystemPromptFromLabels(
-				labels,
-				repository,
+		// Post single procedure selection result (replaces ephemeral routing thought)
+		if (
+			typeof agentSessionManager.postProcedureSelectionThought === "function"
+		) {
+			await agentSessionManager.postProcedureSelectionThought(
+				linearAgentActivitySessionId,
+				finalProcedure.name,
+				finalClassification,
 			);
-			systemPrompt = systemPromptResult?.prompt;
-			systemPromptVersion = systemPromptResult?.version;
-			promptType = systemPromptResult?.type;
+		}
 
-			// Post thought about system prompt selection
-			if (systemPrompt) {
-				await this.postSystemPromptSelectionThought(
-					linearAgentActivitySessionId,
+		// Build and start Claude with initial prompt using full issue (streaming mode)
+		console.log(
+			`[EdgeWorker] Building initial prompt for issue ${fullIssue.identifier}`,
+		);
+		try {
+			// Create input for unified prompt assembly
+			const input: PromptAssemblyInput = {
+				session,
+				fullIssue,
+				repository,
+				userComment: commentBody || "", // Empty for delegation, present for mentions
+				attachmentManifest: attachmentResult.manifest,
+				guidance,
+				agentSession,
+				labels,
+				isNewSession: true,
+				isStreaming: false, // Not yet streaming
+				isMentionTriggered: isMentionTriggered || false,
+				isLabelBasedPromptRequested: isLabelBasedPromptRequested || false,
+			};
+
+			// Use unified prompt assembly
+			const assembly = await this.assemblePrompt(input);
+
+			// Get systemPromptVersion for tracking (TODO: add to PromptAssembly metadata)
+			let systemPromptVersion: string | undefined;
+			let promptType: SystemPromptType | undefined;
+
+			if (!isMentionTriggered || isLabelBasedPromptRequested) {
+				const systemPromptResult = await this.determineSystemPromptFromLabels(
 					labels,
-					repository.id,
+					repository,
+				);
+				systemPromptVersion = systemPromptResult?.version;
+				promptType = systemPromptResult?.type;
+
+				// Post thought about system prompt selection
+				if (assembly.systemPrompt) {
+					await this.postSystemPromptSelectionThought(
+						linearAgentActivitySessionId,
+						labels,
+						repository.id,
+					);
+				}
+			}
+
+			// Build allowed tools list with Linear MCP tools (now with prompt type context)
+			const allowedTools = this.buildAllowedTools(repository, promptType);
+			const disallowedTools = this.buildDisallowedTools(repository, promptType);
+
+			console.log(
+				`[EdgeWorker] Configured allowed tools for ${fullIssue.identifier}:`,
+				allowedTools,
+			);
+			if (disallowedTools.length > 0) {
+				console.log(
+					`[EdgeWorker] Configured disallowed tools for ${fullIssue.identifier}:`,
+					disallowedTools,
 				);
 			}
-		} else {
-			console.log(
-				`[EdgeWorker] Skipping system prompt for mention-triggered session ${linearAgentActivitySessionId}`,
-			);
-		}
 
-		const selection = this.resolveRunnerSelection(labels, repository);
-		this.debugLog(`[handleAgentSessionCreated] Runner selection resolved`, {
-			repositoryId: repository.id,
-			issue: fullIssue.identifier,
-			selection: selection.type,
-		});
+			const selectionMetadata: SessionRunnerMetadata = {
+				...runnerSelection,
+				issueId: issue.id,
+				promptType,
+			};
 
-		// Build allowed tools list with Linear MCP tools (now with prompt type context)
-		const allowedTools = this.buildAllowedTools(repository, promptType);
-		const disallowedTools = this.buildDisallowedTools(repository, promptType);
-
-		const codexPermissions =
-			selection.type === "codex"
-				? this.deriveCodexPermissions(repository, promptType, {
-						allowedTools,
-						disallowedTools,
-					})
-				: undefined;
-		const selectionForSession: RunnerSelection =
-			selection.type === "codex"
-				? {
-						...selection,
-						codexPermissions,
-						promptType,
-					}
-				: selection;
-
-		this.sessionRunnerSelections.set(linearAgentActivitySessionId, {
-			...selectionForSession,
-			issueId: fullIssue.id,
-		});
-		void this.savePersistedState().catch((error) => {
-			this.debugLog(
-				"[handleAgentSessionCreated] Failed to persist runner selection",
-				error,
-			);
-		});
-
-		console.log(
-			`[EdgeWorker] Configured allowed tools for ${fullIssue.identifier}:`,
-			allowedTools,
-		);
-		if (disallowedTools.length > 0) {
-			console.log(
-				`[EdgeWorker] Configured disallowed tools for ${fullIssue.identifier}:`,
-				disallowedTools,
-			);
-		}
-
-		const promptResult =
-			isMentionTriggered && isLabelBasedPromptRequested
-				? await this.buildLabelBasedPrompt(
-						fullIssue,
-						repository,
-						attachmentResult.manifest,
-					)
-				: isMentionTriggered
-					? await this.buildMentionPrompt(
-							fullIssue,
-							agentSession,
-							attachmentResult.manifest,
-						)
-					: systemPrompt
-						? await this.buildLabelBasedPrompt(
-								fullIssue,
-								repository,
-								attachmentResult.manifest,
-							)
-						: await this.buildPromptV2(
-								fullIssue,
-								repository,
-								undefined,
-								attachmentResult.manifest,
-							);
-
-		const { prompt: initialPrompt, version: userPromptVersion } = promptResult;
-
-		const promptWorkflowType =
-			isMentionTriggered && isLabelBasedPromptRequested
-				? "label-based-prompt-command"
-				: isMentionTriggered
-					? "mention"
-					: systemPrompt
-						? "label-based"
-						: "fallback";
-
-		console.log(
-			`[EdgeWorker] Initial prompt built using ${promptWorkflowType} workflow, length: ${initialPrompt.length} characters`,
-		);
-
-		// Emit events using full Linear issue regardless of runner type
-		this.emit("session:started", fullIssue.id, fullIssue, repository.id);
-		this.config.handlers?.onSessionStart?.(
-			fullIssue.id,
-			fullIssue,
-			repository.id,
-		);
-
-		if (selectionForSession.type !== "claude") {
-			await this.startNonClaudeRunner({
-				selection: selectionForSession,
-				repository,
-				prompt: initialPrompt,
-				workspacePath: session.workspace.path,
+			const previousSelection = this.sessionRunnerSelections.get(
 				linearAgentActivitySessionId,
-				issueIdentifier: fullIssue.identifier,
-				isFollowUp: false,
-			});
-			return;
-		}
+			);
 
-		// Create Claude runner with attachment directory access and optional system prompt
-		const runnerConfig = this.buildClaudeRunnerConfig(
-			session,
-			repository,
-			linearAgentActivitySessionId,
-			systemPrompt,
-			allowedTools,
-			allowedDirectories,
-			disallowedTools,
-			undefined, // resumeSessionId
-			labels, // Pass labels for model override
-		);
-		const runner = new ClaudeRunner(runnerConfig);
+			if (runnerSelection.type === "codex") {
+				const cachedResume =
+					this.codexSessionCache.get(linearAgentActivitySessionId) ??
+					previousSelection?.resumeSessionId;
+				const codexPermissions = this.deriveCodexPermissions(
+					repository,
+					promptType,
+					{ allowedTools, disallowedTools },
+				);
+				const codexSelection: SessionRunnerMetadata = {
+					...selectionMetadata,
+					resumeSessionId: cachedResume,
+					codexPermissions,
+				};
+				this.sessionRunnerSelections.set(
+					linearAgentActivitySessionId,
+					codexSelection,
+				);
 
-		// Store runner by comment ID
-		agentSessionManager.addClaudeRunner(linearAgentActivitySessionId, runner);
+				await this.startNonClaudeRunner({
+					selection: codexSelection,
+					repository,
+					prompt: assembly.userPrompt,
+					workspacePath: session.workspace.path,
+					linearAgentActivitySessionId,
+					issueId: fullIssue.id,
+					allowedTools,
+					disallowedTools,
+					promptType,
+					isFollowUp: false,
+				});
 
-		// Save state after mapping changes
-		await this.savePersistedState();
+				// Emit events using full Linear issue
+				this.emit("session:started", fullIssue.id, fullIssue, repository.id);
+				this.config.handlers?.onSessionStart?.(
+					fullIssue.id,
+					fullIssue,
+					repository.id,
+				);
 
-		console.log(`[EdgeWorker] Starting Claude streaming session`);
-		try {
-			if (userPromptVersion || systemPromptVersion) {
+				return;
+			}
+
+			this.sessionRunnerSelections.set(
+				linearAgentActivitySessionId,
+				selectionMetadata,
+			);
+
+			// Create Claude runner with system prompt from assembly
+			const runnerConfig = this.buildClaudeRunnerConfig(
+				session,
+				repository,
+				linearAgentActivitySessionId,
+				assembly.systemPrompt,
+				allowedTools,
+				allowedDirectories,
+				disallowedTools,
+				undefined, // resumeSessionId
+				labels, // Pass labels for model override
+			);
+			const runner = new ClaudeRunner(runnerConfig);
+
+			// Store runner by comment ID
+			agentSessionManager.addClaudeRunner(linearAgentActivitySessionId, runner);
+
+			// Save state after mapping changes
+			await this.savePersistedState();
+
+			// Emit events using full Linear issue
+			this.emit("session:started", fullIssue.id, fullIssue, repository.id);
+			this.config.handlers?.onSessionStart?.(
+				fullIssue.id,
+				fullIssue,
+				repository.id,
+			);
+
+			// Update runner with version information (if available)
+			if (systemPromptVersion) {
 				runner.updatePromptVersions({
-					userPromptVersion,
 					systemPromptVersion,
 				});
 			}
 
-			const sessionInfo = await runner.startStreaming(initialPrompt);
+			// Log metadata for debugging
+			console.log(
+				`[EdgeWorker] Initial prompt built successfully - components: ${assembly.metadata.components.join(", ")}, type: ${assembly.metadata.promptType}, length: ${assembly.userPrompt.length} characters`,
+			);
+
+			console.log(`[EdgeWorker] Starting Claude streaming session`);
+			const sessionInfo = await runner.startStreaming(assembly.userPrompt);
 			console.log(
 				`[EdgeWorker] Claude streaming session started: ${sessionInfo.sessionId}`,
 			);
@@ -1263,6 +3044,8 @@ export class EdgeWorker extends EventEmitter {
 
 		let session = agentSessionManager.getSession(linearAgentActivitySessionId);
 		let isNewSession = false;
+		let fullIssue: LinearIssue | null = null;
+
 		if (!session) {
 			console.log(
 				`[EdgeWorker] No existing session found for agent activity session ${linearAgentActivitySessionId}, creating new session`,
@@ -1285,48 +3068,54 @@ export class EdgeWorker extends EventEmitter {
 			);
 
 			// Destructure session data for new session
-			const {
-				fullIssue: newFullIssue,
-				allowedTools: sessionAllowedTools,
-				disallowedTools: sessionDisallowedTools,
-			} = sessionData;
+			fullIssue = sessionData.fullIssue;
 			session = sessionData.session;
-			const newLabels = await this.fetchIssueLabels(newFullIssue);
-			const newSelection = this.resolveRunnerSelection(newLabels, repository);
-			const newCodexPermissions =
-				newSelection.type === "codex"
-					? this.deriveCodexPermissions(repository, undefined, {
-							allowedTools: sessionAllowedTools,
-							disallowedTools: sessionDisallowedTools,
-						})
-					: undefined;
-			const decoratedSelection: RunnerSelection =
-				newSelection.type === "codex"
-					? {
-							...newSelection,
-							codexPermissions: newCodexPermissions,
-						}
-					: newSelection;
-			this.sessionRunnerSelections.set(linearAgentActivitySessionId, {
-				...decoratedSelection,
-				issueId: newFullIssue.id,
-				resumeSessionId: undefined,
-			});
+
+			console.log(
+				`[EdgeWorker] Created new session ${linearAgentActivitySessionId} (prompted webhook)`,
+			);
 
 			// Save state and emit events for new session
 			await this.savePersistedState();
-			this.emit(
-				"session:started",
-				newFullIssue.id,
-				newFullIssue,
-				repository.id,
-			);
+			this.emit("session:started", fullIssue.id, fullIssue, repository.id);
 			this.config.handlers?.onSessionStart?.(
-				newFullIssue.id,
-				newFullIssue,
+				fullIssue.id,
+				fullIssue,
 				repository.id,
 			);
+		} else {
+			console.log(
+				`[EdgeWorker] Found existing session ${linearAgentActivitySessionId} for new user prompt`,
+			);
+
+			// Post instant acknowledgment for existing session BEFORE any async work
+			// Check streaming status first to determine the message
+			const isCurrentlyStreaming =
+				session?.claudeRunner?.isStreaming() || false;
+
+			await this.postInstantPromptedAcknowledgment(
+				linearAgentActivitySessionId,
+				repository.id,
+				isCurrentlyStreaming,
+			);
+
+			// Need to fetch full issue for routing context
+			const linearClient = this.linearClients.get(repository.id);
+			if (linearClient) {
+				try {
+					fullIssue = await linearClient.issue(issue.id);
+				} catch (error) {
+					console.warn(
+						`[EdgeWorker] Failed to fetch full issue for routing: ${issue.id}`,
+						error,
+					);
+					// Continue with degraded routing context
+				}
+			}
 		}
+
+		// Note: Routing and streaming check happens later in handlePromptWithStreamingCheck
+		// after attachments are processed
 
 		// Ensure session is not null after creation/retrieval
 		if (!session) {
@@ -1335,50 +3124,8 @@ export class EdgeWorker extends EventEmitter {
 			);
 		}
 
-		// Nothing before this should create latency or be async, so that these remain instant and low-latency for user experience
-		const existingRunner = session.claudeRunner;
-		let sessionRunnerSelection = this.sessionRunnerSelections.get(
-			linearAgentActivitySessionId,
-		);
-		if (!sessionRunnerSelection) {
-			const fallbackSelection = this.resolveRunnerSelection([], repository);
-			const fallbackCodexPermissions =
-				fallbackSelection.type === "codex"
-					? this.deriveCodexPermissions(repository)
-					: undefined;
-			const decoratedFallback: RunnerSelection =
-				fallbackSelection.type === "codex"
-					? {
-							...fallbackSelection,
-							codexPermissions: fallbackCodexPermissions,
-						}
-					: fallbackSelection;
-			sessionRunnerSelection = {
-				...decoratedFallback,
-				issueId: session.issueId ?? issue.id,
-			};
-			this.sessionRunnerSelections.set(
-				linearAgentActivitySessionId,
-				sessionRunnerSelection,
-			);
-			void this.savePersistedState().catch((error) => {
-				this.debugLog(
-					"[handleUserPostedAgentActivity] Failed to persist fallback runner selection",
-					error,
-				);
-			});
-		}
-		const isNonClaudeSession =
-			sessionRunnerSelection.type !== undefined &&
-			sessionRunnerSelection.type !== "claude";
-		if (!isNewSession) {
-			// Only post acknowledgment for existing sessions (new sessions already handled it above)
-			await this.postInstantPromptedAcknowledgment(
-				linearAgentActivitySessionId,
-				repository.id,
-				existingRunner?.isStreaming() || false,
-			);
-		}
+		// Acknowledgment already posted above for both new and existing sessions
+		// (before any async routing work to ensure instant user feedback)
 
 		// Get Linear client for this repository
 		const linearClient = this.linearClients.get(repository.id);
@@ -1388,54 +3135,6 @@ export class EdgeWorker extends EventEmitter {
 				repository.id,
 			);
 			return;
-		}
-
-		const promptBody = webhook.agentActivity.content.body;
-		const stopSignal = webhook.agentActivity.signal === "stop";
-
-		// Handle stop signal
-		if (stopSignal) {
-			console.log(
-				`[EdgeWorker] Received stop signal for agent activity session ${linearAgentActivitySessionId}`,
-			);
-
-			// Mark intentional stop to suppress downstream error handling
-			this.stopRequestedSessions.add(linearAgentActivitySessionId);
-
-			if (existingRunner) {
-				existingRunner.stop();
-				console.log(
-					`[EdgeWorker] Stopped Claude session for agent activity session ${linearAgentActivitySessionId}`,
-				);
-			}
-
-			const existingNonClaudeRunner = this.nonClaudeRunners.get(
-				linearAgentActivitySessionId,
-			);
-			if (existingNonClaudeRunner) {
-				await this.safeStopRunner(
-					linearAgentActivitySessionId,
-					existingNonClaudeRunner,
-				);
-			}
-			// Preserve Codex resume metadata and runner selection for follow-up resume
-			// Do not delete codexSessionCache or sessionRunnerSelections here
-			this.finalizedNonClaudeSessions.add(linearAgentActivitySessionId);
-			void this.savePersistedState().catch((error) => {
-				this.debugLog(
-					"[EdgeWorker] Failed to persist state after stop signal",
-					error,
-				);
-			});
-			const issueTitle = issue.title || "this issue";
-			const stopConfirmation = `I've stopped working on ${issueTitle} as requested.\n\n**Stop Signal:** Received from ${webhook.agentSession.creator?.name || "user"}\n**Action Taken:** All ongoing work has been halted`;
-
-			await agentSessionManager.createResponseActivity(
-				linearAgentActivitySessionId,
-				stopConfirmation,
-			);
-
-			return; // Exit early - stop signal handled
 		}
 
 		// Always set up attachments directory, even if no attachments in current comment
@@ -1449,86 +3148,110 @@ export class EdgeWorker extends EventEmitter {
 		await mkdir(attachmentsDir, { recursive: true });
 
 		let attachmentManifest = "";
-		if (commentId) {
-			try {
-				const result = await linearClient.client.rawRequest(
-					`
-	          query GetComment($id: String!) {
-	            comment(id: $id) {
-	              id
-	              body
-	              createdAt
-	              updatedAt
-	              user {
-	                name
-	                id
-	              }
-	            }
-	          }
-	        `,
-					{ id: commentId },
-				);
+		let commentAuthor: string | undefined;
+		let commentTimestamp: string | undefined;
 
-				// Count existing attachments
-				const existingFiles = await readdir(attachmentsDir).catch(() => []);
-				const existingAttachmentCount = existingFiles.filter(
-					(file) => file.startsWith("attachment_") || file.startsWith("image_"),
-				).length;
-
-				// Download new attachments from the comment
-				const downloadResult = await this.downloadCommentAttachments(
-					(result.data as any).comment.body,
-					attachmentsDir,
-					repository.linearToken,
-					existingAttachmentCount,
-				);
-
-				if (downloadResult.totalNewAttachments > 0) {
-					attachmentManifest =
-						this.generateNewAttachmentManifest(downloadResult);
-				}
-			} catch (error) {
-				console.error("Failed to fetch comments for attachments:", error);
-			}
-		} else {
-			this.debugLog(
-				"[handleUserPostedAgentActivity] No source comment id provided; skipping attachment download",
-			);
-		}
-
-		// Check if there's an existing runner for this comment thread
-		if (!isNonClaudeSession && existingRunner?.isStreaming()) {
-			// Add comment with attachment manifest to existing stream
-			console.log(
-				`[EdgeWorker] Adding comment to existing stream for agent activity session ${linearAgentActivitySessionId}`,
-			);
-
-			// Append attachment manifest to the prompt if we have one
-			let fullPrompt = promptBody;
-			if (attachmentManifest) {
-				fullPrompt = `${promptBody}\n\n${attachmentManifest}`;
-			}
-
-			existingRunner.addStreamMessage(fullPrompt);
-			return; // Exit early - comment has been added to stream
-		}
-
-		if (isNonClaudeSession && sessionRunnerSelection) {
-			await this.handleNonClaudeFollowUp({
-				selection: sessionRunnerSelection,
-				session,
-				repository,
-				promptBody,
-				attachmentManifest,
-				linearAgentActivitySessionId,
-				isNewSession,
-			});
-			return;
-		}
-
-		// Use the new resumeClaudeSession function
 		try {
-			await this.resumeClaudeSession(
+			const result = await linearClient.client.rawRequest(
+				`
+          query GetComment($id: String!) {
+            comment(id: $id) {
+              id
+              body
+              createdAt
+              updatedAt
+              user {
+                name
+                displayName
+                email
+                id
+              }
+            }
+          }
+        `,
+				{ id: commentId },
+			);
+
+			// Extract comment data
+			const comment = (result.data as any).comment;
+
+			// Extract comment metadata for multi-player context
+			if (comment) {
+				const user = comment.user;
+				commentAuthor =
+					user?.displayName || user?.name || user?.email || "Unknown";
+				commentTimestamp = comment.createdAt || new Date().toISOString();
+			}
+
+			// Count existing attachments
+			const existingFiles = await readdir(attachmentsDir).catch(() => []);
+			const existingAttachmentCount = existingFiles.filter(
+				(file) => file.startsWith("attachment_") || file.startsWith("image_"),
+			).length;
+
+			// Download new attachments from the comment
+			const downloadResult = await this.downloadCommentAttachments(
+				comment.body,
+				attachmentsDir,
+				repository.linearToken,
+				existingAttachmentCount,
+			);
+
+			if (downloadResult.totalNewAttachments > 0) {
+				attachmentManifest = this.generateNewAttachmentManifest(downloadResult);
+			}
+		} catch (error) {
+			console.error("Failed to fetch comments for attachments:", error);
+		}
+
+		const promptBody = webhook.agentActivity.content.body;
+		const stopSignal = webhook.agentActivity.signal === "stop";
+
+		// Handle stop signal
+		if (stopSignal) {
+			console.log(
+				`[EdgeWorker] Received stop signal for agent activity session ${linearAgentActivitySessionId}`,
+			);
+
+			const currentSelection = this.sessionRunnerSelections.get(
+				linearAgentActivitySessionId,
+			);
+
+			if (currentSelection?.type === "codex") {
+				this.stopRequestedSessions.add(linearAgentActivitySessionId);
+				const codexRunner = this.nonClaudeRunners.get(
+					linearAgentActivitySessionId,
+				);
+				await this.safeStopRunner(linearAgentActivitySessionId, codexRunner);
+				this.finalizedNonClaudeSessions.add(linearAgentActivitySessionId);
+				await this.savePersistedState();
+				console.log(
+					`[EdgeWorker] Stopped Codex session for agent activity session ${linearAgentActivitySessionId}`,
+				);
+			} else {
+				const existingRunner = session.claudeRunner;
+				if (existingRunner) {
+					existingRunner.stop();
+					console.log(
+						`[EdgeWorker] Stopped Claude session for agent activity session ${linearAgentActivitySessionId}`,
+					);
+				}
+			}
+
+			const issueTitle = issue.title || "this issue";
+			const stopConfirmation = `I've stopped working on ${issueTitle} as requested.\n\n**Stop Signal:** Received from ${webhook.agentSession.creator?.name || "user"}\n**Action Taken:** All ongoing work has been halted`;
+
+			await agentSessionManager.createResponseActivity(
+				linearAgentActivitySessionId,
+				stopConfirmation,
+			);
+
+			return; // Exit early - stop signal handled
+		}
+
+		// Use centralized streaming check and routing logic
+		try {
+			await this.handlePromptWithStreamingCheck(
 				session,
 				repository,
 				linearAgentActivitySessionId,
@@ -1537,19 +3260,12 @@ export class EdgeWorker extends EventEmitter {
 				attachmentManifest,
 				isNewSession,
 				[], // No additional allowed directories for regular continuation
+				`prompted webhook (${isNewSession ? "new" : "existing"} session)`,
+				commentAuthor,
+				commentTimestamp,
 			);
 		} catch (error) {
-			console.error("Failed to continue conversation:", error);
-			// Remove any partially created session
-			// this.sessionManager.removeSession(threadRootCommentId)
-			// this.commentToRepo.delete(threadRootCommentId)
-			// this.commentToIssue.delete(threadRootCommentId)
-			// // Start fresh for root comments, or fall back to issue assignment
-			// if (isRootComment) {
-			//   await this.handleNewRootComment(issue, comment, repository)
-			// } else {
-			//   await this.handleIssueAssigned(issue, repository)
-			// }
+			console.error("Failed to handle prompted webhook:", error);
 		}
 	}
 
@@ -1584,41 +3300,29 @@ export class EdgeWorker extends EventEmitter {
 			runner.stop();
 		}
 
-		const nonClaudeSessionsToRemove: string[] = [];
-		for (const [
-			sessionId,
-			metadata,
-		] of this.sessionRunnerSelections.entries()) {
-			if (metadata.issueId !== issue.id || metadata.type === "claude") {
-				continue;
-			}
+		// Stop Codex runners associated with this issue
+		const codexSessionsToStop = Array.from(
+			this.sessionRunnerSelections.entries(),
+		).filter(
+			([, metadata]) =>
+				metadata.type === "codex" && metadata.issueId === issue.id,
+		);
 
-			const runner = this.nonClaudeRunners.get(sessionId);
-			if (runner) {
-				try {
-					await runner.stop();
-				} catch (error) {
-					this.debugLog(
-						`[EdgeWorker] Failed to stop non-Claude runner during unassignment`,
-						error,
-					);
-				}
-				this.nonClaudeRunners.delete(sessionId);
-			}
-
-			if (metadata.type === "codex") {
-				this.codexSessionCache.delete(sessionId);
-			}
-
-			nonClaudeSessionsToRemove.push(sessionId);
+		for (const [sessionId] of codexSessionsToStop) {
+			console.log(
+				`[EdgeWorker] Stopping Codex runner for issue ${issue.identifier} (session ${sessionId})`,
+			);
+			const codexRunner = this.nonClaudeRunners.get(sessionId);
+			await this.safeStopRunner(sessionId, codexRunner);
+			this.finalizedNonClaudeSessions.add(sessionId);
 		}
 
-		nonClaudeSessionsToRemove.forEach((sessionId) => {
-			this.sessionRunnerSelections.delete(sessionId);
-		});
+		if (codexSessionsToStop.length > 0) {
+			await this.savePersistedState();
+		}
 
 		// Post ONE farewell comment on the issue (not in any thread) if there were active sessions
-		if (activeThreadCount > 0 || nonClaudeSessionsToRemove.length > 0) {
+		if (activeThreadCount > 0) {
 			await this.postComment(
 				issue.id,
 				"I've been unassigned and am stopping work now.",
@@ -1653,9 +3357,13 @@ export class EdgeWorker extends EventEmitter {
 
 	/**
 	 * Handle Claude session error
-	 * TODO: improve this
+	 * Silently ignores AbortError (user-initiated stop), logs other errors
 	 */
 	private async handleClaudeError(error: Error): Promise<void> {
+		// AbortError is expected when user stops Claude process, don't log it
+		if (error instanceof AbortError) {
+			return;
+		}
 		console.error("Unhandled claude error:", error);
 	}
 
@@ -1675,232 +3383,6 @@ export class EdgeWorker extends EventEmitter {
 		}
 	}
 
-	private resolveRunnerSelection(
-		labels: string[],
-		repository: RepositoryConfig,
-	): RunnerSelection {
-		const match: RunnerSelection | null = (() => {
-			for (const rule of repository.labelAgentRouting ?? []) {
-				if (!rule.labels.some((label) => labels.includes(label))) continue;
-				const runner = this.normalizeRunnerType(rule.runner, {
-					scope: "labelAgentRouting",
-					repositoryId: repository.id,
-					labels,
-				});
-				if (!runner) continue;
-				return {
-					type: runner,
-					model: rule.model,
-				};
-			}
-
-			const repoRunner = this.normalizeRunnerType(repository.runner, {
-				scope: "repository.runner",
-				repositoryId: repository.id,
-			});
-			if (repoRunner) {
-				if (repoRunner === "codex") {
-					return {
-						type: "codex",
-						model:
-							repository.runnerModels?.codex?.model ||
-							this.config.cliDefaults?.codex?.model,
-					};
-				}
-				return {
-					type: "claude",
-					model:
-						repository.runnerModels?.claude?.model ||
-						repository.model ||
-						this.config.cliDefaults?.claude?.model ||
-						this.config.defaultModel,
-				};
-			}
-
-			return null;
-		})();
-
-		if (match) {
-			this.debugLog(
-				`[resolveRunnerSelection] Matched runner via label or repo override`,
-				{
-					repositoryId: repository.id,
-					runner: match.type,
-					labels,
-				},
-			);
-			return match;
-		}
-
-		const defaultCli =
-			this.normalizeRunnerType(this.config.defaultCli, {
-				scope: "config.defaultCli",
-				repositoryId: repository.id,
-			}) ?? "claude";
-		let resolved: RunnerSelection;
-		if (defaultCli === "codex") {
-			resolved = {
-				type: "codex",
-				model: this.config.cliDefaults?.codex?.model,
-			};
-		} else {
-			resolved = {
-				type: "claude",
-				model:
-					repository.model ||
-					this.config.cliDefaults?.claude?.model ||
-					this.config.defaultModel,
-			};
-		}
-
-		this.debugLog(`[resolveRunnerSelection] Using default runner selection`, {
-			repositoryId: repository.id,
-			runner: resolved.type,
-			labels,
-		});
-		return resolved;
-	}
-
-	private normalizeRunnerType(
-		runner: unknown,
-		context?: { scope: string; repositoryId?: string; labels?: string[] },
-	): RunnerType | undefined {
-		if (typeof runner === "string") {
-			const value = runner.toLowerCase();
-			if (value === "claude" || value === "codex") {
-				return value as RunnerType;
-			}
-		}
-		if (context) {
-			this.debugLog("[normalizeRunnerType] Ignoring unsupported runner", {
-				scope: context.scope,
-				repositoryId: context.repositoryId,
-				runner,
-				labels: context.labels,
-			});
-		}
-		return undefined;
-	}
-
-	private getOpenAiApiKey(): string | undefined {
-		if (process.env.OPENAI_API_KEY) {
-			return process.env.OPENAI_API_KEY;
-		}
-
-		const configured = this.config.credentials?.openaiApiKey;
-		if (!configured) {
-			return undefined;
-		}
-
-		if (configured.startsWith("env:")) {
-			const envVar = configured.slice(4);
-			return process.env[envVar];
-		}
-
-		return configured;
-	}
-
-	private normalizeError(value: unknown, fallback = "Unknown error"): Error {
-		if (value instanceof Error) {
-			return value;
-		}
-		if (typeof value === "string") {
-			return new Error(value);
-		}
-		if (value && typeof value === "object") {
-			try {
-				return new Error(JSON.stringify(value));
-			} catch (_error) {
-				return new Error(fallback);
-			}
-		}
-		return new Error(fallback);
-	}
-
-	private buildPromptPathCandidates(promptPath: string): string[] {
-		if (!promptPath) {
-			return [];
-		}
-
-		const trimmed = promptPath.trim();
-		if (!trimmed) {
-			return [];
-		}
-
-		const candidates = new Set<string>();
-
-		if (trimmed.startsWith("~/")) {
-			const relativeSegment = trimmed.slice(2);
-			if (this.cyrusHome) {
-				candidates.add(join(this.cyrusHome, relativeSegment));
-			}
-			const userHome = process.env.HOME;
-			if (userHome) {
-				candidates.add(join(userHome, relativeSegment));
-			}
-		}
-
-		if (isAbsolute(trimmed)) {
-			candidates.add(trimmed);
-		} else {
-			if (this.cyrusHome) {
-				candidates.add(resolve(this.cyrusHome, trimmed));
-			}
-			candidates.add(resolve(trimmed));
-		}
-
-		return Array.from(candidates);
-	}
-
-	private async loadPromptTemplateFromPath(
-		promptName: string,
-		promptPath: string,
-	): Promise<{ prompt: string; version?: string } | undefined> {
-		const candidates = this.buildPromptPathCandidates(promptPath);
-		if (candidates.length === 0) {
-			return undefined;
-		}
-
-		let lastError: unknown;
-		for (const candidate of candidates) {
-			try {
-				const promptContent = await readFile(candidate, "utf-8");
-				const promptVersion = this.extractVersionTag(promptContent);
-				return { prompt: promptContent, version: promptVersion };
-			} catch (error) {
-				lastError = error;
-			}
-		}
-
-		const errorMessage =
-			lastError instanceof Error
-				? lastError.message
-				: lastError
-					? String(lastError)
-					: "unknown error";
-		console.warn(
-			`[EdgeWorker] Failed to load custom prompt "${promptName}" from ${promptPath}: ${errorMessage}`,
-		);
-		return undefined;
-	}
-
-	private async loadBuiltInPrompt(
-		promptName: string,
-	): Promise<{ prompt: string; version?: string } | undefined> {
-		try {
-			const promptPath = join(BUILT_IN_PROMPTS_DIR, `${promptName}.md`);
-			const promptContent = await readFile(promptPath, "utf-8");
-			const promptVersion = this.extractVersionTag(promptContent);
-			return { prompt: promptContent, version: promptVersion };
-		} catch (error) {
-			console.error(
-				`[EdgeWorker] Failed to load built-in ${promptName} prompt template:`,
-				error,
-			);
-			return undefined;
-		}
-	}
-
 	/**
 	 * Determine system prompt based on issue labels and repository configuration
 	 */
@@ -1911,105 +3393,117 @@ export class EdgeWorker extends EventEmitter {
 		| {
 				prompt: string;
 				version?: string;
-				type?: string;
+				type?: SystemPromptType;
 		  }
 		| undefined
 	> {
-		if (!repository.labelPrompts || labels.length === 0) {
+		if (labels.length === 0) {
 			return undefined;
 		}
 
-		const labelPrompts = repository.labelPrompts;
-		const orderedEntries: Array<[string, PromptRuleConfig | string[]]> = [];
+		const normalizedLabels = labels.map((label) => label.toLowerCase());
 
-		for (const builtIn of BUILT_IN_PROMPT_TYPES) {
-			const config = labelPrompts[builtIn];
-			if (config) {
-				orderedEntries.push([builtIn, config]);
+		const promptTypes: readonly SystemPromptType[] = [
+			"debugger",
+			"builder",
+			"scoper",
+			"orchestrator",
+		];
+
+		for (const promptType of promptTypes) {
+			const repoConfig = this.normalizePromptRuleConfig(
+				repository.labelPrompts?.[promptType],
+			);
+			const globalConfig = this.normalizePromptRuleConfig(
+				this.config.promptDefaults?.[promptType],
+			);
+
+			const repoMatches =
+				repoConfig &&
+				this.promptConfigMatchesLabels(repoConfig.labels, normalizedLabels);
+			const globalMatches =
+				globalConfig &&
+				this.promptConfigMatchesLabels(globalConfig.labels, normalizedLabels);
+
+			const candidateConfigs: Array<{
+				source: "repository" | "global";
+				config: { labels: string[]; promptPath?: string; version?: string };
+				useDefaultTemplate: boolean;
+			}> = [];
+
+			let repoFallback: {
+				source: "repository";
+				config: { labels: string[]; promptPath?: string; version?: string };
+				useDefaultTemplate: boolean;
+			} | null = null;
+			let globalFallback: {
+				source: "global";
+				config: { labels: string[]; promptPath?: string; version?: string };
+				useDefaultTemplate: boolean;
+			} | null = null;
+
+			if (repoMatches && repoConfig) {
+				if (repoConfig.promptPath) {
+					candidateConfigs.push({
+						source: "repository",
+						config: repoConfig,
+						useDefaultTemplate: false,
+					});
+				} else {
+					repoFallback = {
+						source: "repository",
+						config: repoConfig,
+						useDefaultTemplate: true,
+					};
+				}
 			}
-		}
 
-		for (const [promptName, config] of Object.entries(labelPrompts)) {
-			if (!BUILT_IN_PROMPT_TYPE_SET.has(promptName) && config) {
-				orderedEntries.push([
-					promptName,
-					config as PromptRuleConfig | string[],
-				]);
-			}
-		}
-
-		for (const [promptName, rawConfig] of orderedEntries) {
-			const configuredLabels = Array.isArray(rawConfig)
-				? rawConfig
-				: rawConfig?.labels;
-
-			if (!configuredLabels?.some((label) => labels.includes(label))) {
-				continue;
+			if (globalMatches && globalConfig) {
+				if (globalConfig.promptPath) {
+					candidateConfigs.push({
+						source: "global",
+						config: globalConfig,
+						useDefaultTemplate: false,
+					});
+				} else {
+					globalFallback = {
+						source: "global",
+						config: globalConfig,
+						useDefaultTemplate: true,
+					};
+				}
 			}
 
-			let promptSource: "repository" | "global" | "built-in" = "built-in";
-			let promptResult: { prompt: string; version?: string } | undefined;
+			if (repoFallback) {
+				candidateConfigs.push(repoFallback);
+			}
+			if (globalFallback) {
+				candidateConfigs.push(globalFallback);
+			}
 
-			const promptRule = Array.isArray(rawConfig)
-				? undefined
-				: (rawConfig as PromptRuleConfig);
-
-			if (promptRule?.promptPath) {
-				const repositoryPrompt = await this.loadPromptTemplateFromPath(
-					promptName,
-					promptRule.promptPath,
+			for (const candidate of candidateConfigs) {
+				const promptPath = candidate.useDefaultTemplate
+					? undefined
+					: this.resolvePromptFilePath(candidate.config.promptPath);
+				const promptContent = await this.loadPromptTemplate(
+					promptType,
+					promptPath,
 				);
-				if (repositoryPrompt) {
-					promptResult = repositoryPrompt;
-					promptSource = "repository";
+				if (!promptContent) {
+					continue;
 				}
-			}
 
-			if (!promptResult) {
-				const globalRule = this.config.promptDefaults?.[promptName];
-				if (globalRule?.promptPath) {
-					const globalPrompt = await this.loadPromptTemplateFromPath(
-						promptName,
-						globalRule.promptPath,
-					);
-					if (globalPrompt) {
-						promptResult = globalPrompt;
-						promptSource = "global";
-					}
-				}
-			}
-
-			if (!promptResult) {
-				const builtInPrompt = await this.loadBuiltInPrompt(promptName);
-				if (builtInPrompt) {
-					promptResult = builtInPrompt;
-					promptSource = "built-in";
-				}
-			}
-
-			if (promptResult) {
-				const labelList = labels.join(", ");
-				const sourceDescription =
-					promptSource === "repository"
-						? "repository custom prompt"
-						: promptSource === "global"
-							? "global default prompt"
-							: "built-in prompt";
+				const resolvedVersion =
+					candidate.config.version || this.extractVersionTag(promptContent);
 
 				console.log(
-					`[EdgeWorker] Using ${promptName} system prompt (${sourceDescription}) for labels: ${labelList}`,
+					`[EdgeWorker] Using ${promptType} system prompt from ${candidate.source} configuration`,
 				);
 
-				if (promptResult.version) {
-					console.log(
-						`[EdgeWorker] ${promptName} system prompt version: ${promptResult.version}`,
-					);
-				}
-
 				return {
-					prompt: promptResult.prompt,
-					version: promptResult.version,
-					type: promptName,
+					prompt: promptContent,
+					version: resolvedVersion,
+					type: promptType,
 				};
 			}
 		}
@@ -2021,12 +3515,15 @@ export class EdgeWorker extends EventEmitter {
 	 * Build simplified prompt for label-based workflows
 	 * @param issue Full Linear issue
 	 * @param repository Repository configuration
+	 * @param attachmentManifest Optional attachment manifest
+	 * @param guidance Optional agent guidance rules from Linear
 	 * @returns Formatted prompt string
 	 */
 	private async buildLabelBasedPrompt(
 		issue: LinearIssue,
 		repository: RepositoryConfig,
 		attachmentManifest: string = "",
+		guidance?: LinearWebhookGuidanceRule[],
 	): Promise<{ prompt: string; version?: string }> {
 		console.log(
 			`[EdgeWorker] buildLabelBasedPrompt called for issue ${issue.identifier}`,
@@ -2154,12 +3651,16 @@ export class EdgeWorker extends EventEmitter {
 				.replace(/{{workspace_teams}}/g, workspaceTeams)
 				.replace(/{{workspace_labels}}/g, workspaceLabels);
 
+			// Append agent guidance if present
+			prompt += this.formatAgentGuidance(guidance);
+
 			if (attachmentManifest) {
 				console.log(
 					`[EdgeWorker] Adding attachment manifest to label-based prompt, length: ${attachmentManifest.length} characters`,
 				);
 				prompt = `${prompt}\n\n${attachmentManifest}`;
 			}
+
 			console.log(
 				`[EdgeWorker] Label-based prompt built successfully, length: ${prompt.length} characters`,
 			);
@@ -2176,23 +3677,28 @@ export class EdgeWorker extends EventEmitter {
 	 * @param repository Repository configuration
 	 * @param agentSession The agent session containing the mention
 	 * @param attachmentManifest Optional attachment manifest to append
+	 * @param guidance Optional agent guidance rules from Linear
 	 * @returns The constructed prompt and optional version tag
 	 */
 	private async buildMentionPrompt(
 		issue: LinearIssue,
 		agentSession: LinearWebhookAgentSession,
 		attachmentManifest: string = "",
+		guidance?: LinearWebhookGuidanceRule[],
 	): Promise<{ prompt: string; version?: string }> {
 		try {
 			console.log(
 				`[EdgeWorker] Building mention prompt for issue ${issue.identifier}`,
 			);
 
-			// Get the mention comment body
+			// Get the mention comment metadata
 			const mentionContent = agentSession.comment?.body || "";
+			const authorName =
+				agentSession.creator?.name || agentSession.creator?.id || "Unknown";
+			const timestamp = agentSession.createdAt || new Date().toISOString();
 
-			// Build a simple prompt focused on the mention
-			let prompt = `You were mentioned in a Linear comment. Please help with the following request.
+			// Build a focused prompt with comment metadata
+			let prompt = `You were mentioned in a Linear comment on this issue:
 
 <linear_issue>
   <id>${issue.id}</id>
@@ -2201,11 +3707,18 @@ export class EdgeWorker extends EventEmitter {
   <url>${issue.url}</url>
 </linear_issue>
 
-<mention_request>
+<mention_comment>
+  <author>${authorName}</author>
+  <timestamp>${timestamp}</timestamp>
+  <content>
 ${mentionContent}
-</mention_request>
+  </content>
+</mention_comment>
 
-IMPORTANT: You were specifically mentioned in the comment above. Focus on addressing the specific question or request in the mention. You can use the Linear MCP tools to fetch additional context about the issue if needed.`;
+Focus on addressing the specific request in the mention. You can use the Linear MCP tools to fetch additional context if needed.`;
+
+			// Append agent guidance if present
+			prompt += this.formatAgentGuidance(guidance);
 
 			// Append attachment manifest if any
 			if (attachmentManifest) {
@@ -2232,6 +3745,35 @@ IMPORTANT: You were specifically mentioned in the comment above. Focus on addres
 		const version = versionTagMatch ? versionTagMatch[1] : undefined;
 		// Return undefined for empty strings
 		return version?.trim() ? version : undefined;
+	}
+
+	/**
+	 * Format agent guidance rules as markdown for injection into prompts
+	 * @param guidance Array of guidance rules from Linear
+	 * @returns Formatted markdown string with guidance, or empty string if no guidance
+	 */
+	private formatAgentGuidance(guidance?: LinearWebhookGuidanceRule[]): string {
+		if (!guidance || guidance.length === 0) {
+			return "";
+		}
+
+		let formatted =
+			"\n\n<agent_guidance>\nThe following guidance has been configured for this workspace/team in Linear. Team-specific guidance takes precedence over workspace-level guidance.\n";
+
+		for (const rule of guidance) {
+			let origin = "Global";
+			if (rule.origin) {
+				if (rule.origin.__typename === "TeamOriginWebhookPayload") {
+					origin = `Team (${rule.origin.team.displayName})`;
+				} else {
+					origin = "Organization";
+				}
+			}
+			formatted += `\n## Guidance from ${origin}\n${rule.body}\n`;
+		}
+
+		formatted += "\n</agent_guidance>";
+		return formatted;
 	}
 
 	/**
@@ -2432,16 +3974,18 @@ ${reply.body}
 	 * @param repository Repository configuration
 	 * @param newComment Optional new comment to focus on (for handleNewRootComment)
 	 * @param attachmentManifest Optional attachment manifest
+	 * @param guidance Optional agent guidance rules from Linear
 	 * @returns Formatted prompt string
 	 */
-	private async buildPromptV2(
+	private async buildIssueContextPrompt(
 		issue: LinearIssue,
 		repository: RepositoryConfig,
 		newComment?: LinearWebhookComment,
 		attachmentManifest: string = "",
+		guidance?: LinearWebhookGuidanceRule[],
 	): Promise<{ prompt: string; version?: string }> {
 		console.log(
-			`[EdgeWorker] buildPromptV2 called for issue ${issue.identifier}${newComment ? " with new comment" : ""}`,
+			`[EdgeWorker] buildIssueContextPrompt called for issue ${issue.identifier}${newComment ? " with new comment" : ""}`,
 		);
 
 		try {
@@ -2450,11 +3994,14 @@ ${reply.body}
 				repository.promptTemplatePath ||
 				this.config.features?.promptTemplatePath;
 
-			// If no custom template, use the v2 template
+			// If no custom template, use the standard issue assigned user prompt template
 			if (!templatePath) {
 				const __filename = fileURLToPath(import.meta.url);
 				const __dirname = dirname(__filename);
-				templatePath = resolve(__dirname, "../prompt-template-v2.md");
+				templatePath = resolve(
+					__dirname,
+					"../prompts/standard-issue-assigned-user-prompt.md",
+				);
 			}
 
 			// Load the template
@@ -2564,9 +4111,12 @@ IMPORTANT: Focus specifically on addressing the new comment above. This is a new
 					.replace(/{{new_comment_timestamp}}/g, new Date().toLocaleString())
 					.replace(/{{new_comment_content}}/g, newComment.body || "");
 			} else {
-				// Remove the new comment section entirely
-				prompt = prompt.replace(/{{#if new_comment}}[\s\S]*?{{\/if}}/g, "");
+				// Remove the new comment section entirely (including preceding newlines)
+				prompt = prompt.replace(/\n*{{#if new_comment}}[\s\S]*?{{\/if}}/g, "");
 			}
+
+			// Append agent guidance if present
+			prompt += this.formatAgentGuidance(guidance);
 
 			// Append attachment manifest if provided
 			if (attachmentManifest) {
@@ -3290,13 +4840,13 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		parentSessionId?: string,
 	): Record<string, McpServerConfig> {
 		// Always inject the Linear MCP servers with the repository's token
+		// https://linear.app/docs/mcp
 		const mcpConfig: Record<string, McpServerConfig> = {
 			linear: {
-				type: "stdio",
-				command: "npx",
-				args: ["-y", "@tacticlaunch/mcp-linear"],
-				env: {
-					LINEAR_API_TOKEN: repository.linearToken,
+				type: "http",
+				url: "https://mcp.linear.app/mcp",
+				headers: {
+					Authorization: `Bearer ${repository.linearToken}`,
 				},
 			},
 			"cyrus-tools": createCyrusToolsServer(repository.linearToken, {
@@ -3315,6 +4865,10 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 					console.log(
 						`[EdgeWorker] Processing feedback delivery to child session ${childSessionId}`,
 					);
+
+					// Find the parent session ID for context
+					const parentSessionId =
+						this.childToParentAgentSession.get(childSessionId);
 
 					// Find the repository containing the child session
 					// We need to search all repositories for this child session
@@ -3350,14 +4904,66 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 						`[EdgeWorker] Found child session - Issue: ${childSession.issueId}`,
 					);
 
+					// Get parent session info for better context in the thought
+					let parentIssueId: string | undefined;
+					if (parentSessionId) {
+						// Find parent session across all repositories
+						for (const manager of this.agentSessionManagers.values()) {
+							const parentSession = manager.getSession(parentSessionId);
+							if (parentSession) {
+								parentIssueId =
+									parentSession.issue?.identifier || parentSession.issueId;
+								break;
+							}
+						}
+					}
+
+					// Post thought to Linear showing feedback receipt
+					const linearClient = this.linearClients.get(childRepo.id);
+					if (linearClient) {
+						const feedbackThought = parentIssueId
+							? `Received feedback from orchestrator (${parentIssueId}):\n\n---\n\n${message}\n\n---`
+							: `Received feedback from orchestrator:\n\n---\n\n${message}\n\n---`;
+
+						try {
+							const result = await linearClient.createAgentActivity({
+								agentSessionId: childSessionId,
+								content: {
+									type: "thought",
+									body: feedbackThought,
+								},
+							});
+
+							if (result.success) {
+								console.log(
+									`[EdgeWorker] Posted feedback receipt thought for child session ${childSessionId}`,
+								);
+							} else {
+								console.error(
+									`[EdgeWorker] Failed to post feedback receipt thought:`,
+									result,
+								);
+							}
+						} catch (error) {
+							console.error(
+								`[EdgeWorker] Error posting feedback receipt thought:`,
+								error,
+							);
+						}
+					}
+
 					// Format the feedback as a prompt for the child session with enhanced markdown formatting
 					const feedbackPrompt = `## Received feedback from orchestrator\n\n---\n\n${message}\n\n---`;
 
-					// Resume the CHILD session with the feedback from the parent
+					// Use centralized streaming check and routing logic
 					// Important: We don't await the full session completion to avoid timeouts.
 					// The feedback is delivered immediately when the session starts, so we can
 					// return success right away while the session continues in the background.
-					this.resumeClaudeSession(
+					console.log(
+						`[EdgeWorker] Handling feedback delivery to child session ${childSessionId}`,
+					);
+
+					this.handlePromptWithStreamingCheck(
 						childSession,
 						childRepo,
 						childSessionId,
@@ -3366,6 +4972,7 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 						"", // No attachment manifest for feedback
 						false, // Not a new session
 						[], // No additional allowed directories for feedback
+						"give feedback to child",
 					)
 						.then(() => {
 							console.log(
@@ -3374,12 +4981,12 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 						})
 						.catch((error) => {
 							console.error(
-								`[EdgeWorker] Failed to complete child session with feedback:`,
+								`[EdgeWorker] Failed to process feedback in child session:`,
 								error,
 							);
 						});
 
-					// Return success immediately after initiating the session
+					// Return success immediately after initiating the handling
 					console.log(
 						`[EdgeWorker] Feedback delivered successfully to child session ${childSessionId}`,
 					);
@@ -3387,6 +4994,25 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 				},
 			}),
 		};
+
+		// Add OpenAI-based MCP servers if API key is configured
+		if (repository.openaiApiKey) {
+			// Sora video generation tools
+			mcpConfig["sora-tools"] = createSoraToolsServer({
+				apiKey: repository.openaiApiKey,
+				outputDirectory: repository.openaiOutputDirectory,
+			});
+
+			// GPT Image generation tools
+			mcpConfig["image-tools"] = createImageToolsServer({
+				apiKey: repository.openaiApiKey,
+				outputDirectory: repository.openaiOutputDirectory,
+			});
+
+			console.log(
+				`[EdgeWorker] Configured OpenAI MCP servers (Sora + GPT Image) for repository: ${repository.name}`,
+			);
+		}
 
 		return mcpConfig;
 	}
@@ -3402,10 +5028,8 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		switch (preset) {
 			case "readOnly":
 				return getReadOnlyTools();
-			case "safe": {
-				const tools = [...getSafeTools(), ...SAFE_BASH_TOOL_ALLOWLIST];
-				return [...new Set(tools)];
-			}
+			case "safe":
+				return getSafeTools();
 			case "all":
 				return getAllTools();
 			case "coordinator":
@@ -3416,103 +5040,397 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		}
 	}
 
-	private deriveCodexPermissions(
-		repository: RepositoryConfig,
-		promptType?: string,
-		options?: {
-			allowedTools?: string[];
-			disallowedTools?: string[];
-		},
-	): CodexRunnerPermissions {
-		const allowedTools =
-			options?.allowedTools ?? this.buildAllowedTools(repository, promptType);
-		const disallowedTools =
-			options?.disallowedTools ??
-			this.buildDisallowedTools(repository, promptType);
-
-		const effectiveTools = allowedTools.filter(
-			(tool) => !disallowedTools.includes(tool),
-		);
-		const normalizedTools = effectiveTools.map((tool) =>
-			tool.trim().toLowerCase(),
-		);
-
-		const hasGitBash = normalizedTools.some((tool) =>
-			tool.startsWith("bash(git:"),
-		);
-		const hasGeneralBash = normalizedTools.some(
-			(tool) => tool.startsWith("bash") && !tool.startsWith("bash(git:"),
-		);
-		const hasWriteTool = normalizedTools.some(
-			(tool) =>
-				tool.startsWith("edit") ||
-				tool.includes("write") ||
-				tool.endsWith("edit"),
-		);
-
-		const profile: CodexPermissionProfile = hasGeneralBash
-			? "all"
-			: hasWriteTool || hasGitBash
-				? "safe"
-				: "readOnly";
-
-		const mapping: Record<CodexPermissionProfile, CodexRunnerPermissions> = {
-			readOnly: {
-				profile: "readOnly",
-				sandbox: "read-only",
-				approvalPolicy: "never",
-				fullAuto: false,
-			},
-			safe: {
-				profile: "safe",
-				sandbox: "danger-full-access",
-				approvalPolicy: "never",
-				fullAuto: false,
-			},
-			all: {
-				profile: "all",
-				sandbox: "danger-full-access",
-				approvalPolicy: "never",
-				fullAuto: false,
-			},
-		};
-
-		this.debugLog(`[deriveCodexPermissions] Derived ${profile} profile`, {
-			repositoryId: repository.id,
-			promptType,
-			effectiveTools,
-		});
-
-		return mapping[profile];
-	}
-
 	/**
-	 * Build prompt for a session - handles both new and existing sessions
+	 * Build the complete prompt for a session - shows full prompt assembly in one place.
+	 * Returns the assembled prompt plus optional template version metadata.
 	 */
-	private async buildSessionPrompt(
+	private async buildPromptV2(
 		isNewSession: boolean,
+		session: CyrusAgentSession,
 		fullIssue: LinearIssue,
 		repository: RepositoryConfig,
 		promptBody: string,
 		attachmentManifest?: string,
+		commentAuthor?: string,
+		commentTimestamp?: string,
+	): Promise<{ prompt: string; version?: string }> {
+		const prompt = await this.buildSessionPrompt(
+			isNewSession,
+			session,
+			fullIssue,
+			repository,
+			promptBody,
+			attachmentManifest,
+			commentAuthor,
+			commentTimestamp,
+		);
+		return { prompt, version: undefined };
+	}
+
+	private async buildSessionPrompt(
+		isNewSession: boolean,
+		session: CyrusAgentSession,
+		fullIssue: LinearIssue,
+		repository: RepositoryConfig,
+		promptBody: string,
+		attachmentManifest?: string,
+		commentAuthor?: string,
+		commentTimestamp?: string,
 	): Promise<string> {
-		if (isNewSession) {
-			// For completely new sessions, create a complete initial prompt
-			const promptResult = await this.buildPromptV2(
-				fullIssue,
-				repository,
-				undefined,
-				attachmentManifest,
-			);
-			// Add the user's comment to the initial prompt
-			return `${promptResult.prompt}\n\nUser comment: ${promptBody}`;
-		} else {
-			// For existing sessions, just use the comment with attachment manifest
-			const manifestSuffix = attachmentManifest
-				? `\n\n${attachmentManifest}`
-				: "";
-			return `${promptBody}${manifestSuffix}`;
+		// Fetch labels for system prompt determination
+		const labels = await this.fetchIssueLabels(fullIssue);
+
+		// Create input for unified prompt assembly
+		const input: PromptAssemblyInput = {
+			session,
+			fullIssue,
+			repository,
+			userComment: promptBody,
+			commentAuthor,
+			commentTimestamp,
+			attachmentManifest,
+			isNewSession,
+			isStreaming: false, // This path is only for non-streaming prompts
+			labels,
+		};
+
+		// Use unified prompt assembly
+		const assembly = await this.assemblePrompt(input);
+
+		// Log metadata for debugging
+		console.log(
+			`[EdgeWorker] Built prompt - components: ${assembly.metadata.components.join(", ")}, type: ${assembly.metadata.promptType}`,
+		);
+
+		return assembly.userPrompt;
+	}
+
+	/**
+	 * Assemble a complete prompt - unified entry point for all prompt building
+	 * This method contains all prompt assembly logic in one place
+	 */
+	private async assemblePrompt(
+		input: PromptAssemblyInput,
+	): Promise<PromptAssembly> {
+		// If actively streaming, just pass through the comment
+		if (input.isStreaming) {
+			return this.buildStreamingPrompt(input);
 		}
+
+		// If new session, build full prompt with all components
+		if (input.isNewSession) {
+			return this.buildNewSessionPrompt(input);
+		}
+
+		// Existing session continuation - just user comment + attachments
+		return this.buildContinuationPrompt(input);
+	}
+
+	/**
+	 * Build prompt for actively streaming session - pass through user comment as-is
+	 */
+	private buildStreamingPrompt(input: PromptAssemblyInput): PromptAssembly {
+		const components: PromptComponent[] = ["user-comment"];
+		if (input.attachmentManifest) {
+			components.push("attachment-manifest");
+		}
+
+		const parts: string[] = [input.userComment];
+		if (input.attachmentManifest) {
+			parts.push(input.attachmentManifest);
+		}
+
+		return {
+			systemPrompt: undefined,
+			userPrompt: parts.join("\n\n"),
+			metadata: {
+				components,
+				promptType: "continuation",
+				isNewSession: false,
+				isStreaming: true,
+			},
+		};
+	}
+
+	/**
+	 * Build prompt for new session - includes issue context, subroutine prompt, and user comment
+	 */
+	private async buildNewSessionPrompt(
+		input: PromptAssemblyInput,
+	): Promise<PromptAssembly> {
+		const components: PromptComponent[] = [];
+		const parts: string[] = [];
+
+		// 1. Determine system prompt from labels
+		// Only for delegation (not mentions) or when /label-based-prompt is requested
+		let labelBasedSystemPrompt: string | undefined;
+		if (!input.isMentionTriggered || input.isLabelBasedPromptRequested) {
+			labelBasedSystemPrompt = await this.determineSystemPromptForAssembly(
+				input.labels || [],
+				input.repository,
+			);
+		}
+
+		// 2. Determine system prompt based on prompt type
+		// Label-based: Use only the label-based system prompt
+		// Fallback: Use scenarios system prompt (shared instructions)
+		let systemPrompt: string;
+		if (labelBasedSystemPrompt) {
+			// Use label-based system prompt as-is (no shared instructions)
+			systemPrompt = labelBasedSystemPrompt;
+		} else {
+			// Use scenarios system prompt for fallback cases
+			const sharedInstructions = await this.loadSharedInstructions();
+			systemPrompt = sharedInstructions;
+		}
+
+		// 3. Build issue context using appropriate builder
+		// Use label-based prompt ONLY if we have a label-based system prompt
+		const promptType = this.determinePromptType(
+			input,
+			!!labelBasedSystemPrompt,
+		);
+		const issueContext = await this.buildIssueContextForPromptAssembly(
+			input.fullIssue,
+			input.repository,
+			promptType,
+			input.attachmentManifest,
+			input.guidance,
+			input.agentSession,
+		);
+
+		parts.push(issueContext.prompt);
+		components.push("issue-context");
+
+		// 4. Load and append initial subroutine prompt
+		const currentSubroutine = this.procedureRouter.getCurrentSubroutine(
+			input.session,
+		);
+		let subroutineName: string | undefined;
+		if (currentSubroutine) {
+			const subroutinePrompt =
+				await this.loadSubroutinePrompt(currentSubroutine);
+			if (subroutinePrompt) {
+				parts.push(subroutinePrompt);
+				components.push("subroutine-prompt");
+				subroutineName = currentSubroutine.name;
+			}
+		}
+
+		// 5. Add user comment (if present)
+		// Skip for mention-triggered prompts since the comment is already in the mention block
+		if (input.userComment.trim() && !input.isMentionTriggered) {
+			// If we have author/timestamp metadata, include it for multi-player context
+			if (input.commentAuthor || input.commentTimestamp) {
+				const author = input.commentAuthor || "Unknown";
+				const timestamp = input.commentTimestamp || new Date().toISOString();
+				parts.push(`<user_comment>
+  <author>${author}</author>
+  <timestamp>${timestamp}</timestamp>
+  <content>
+${input.userComment}
+  </content>
+</user_comment>`);
+			} else {
+				// Legacy format without metadata
+				parts.push(`<user_comment>\n${input.userComment}\n</user_comment>`);
+			}
+			components.push("user-comment");
+		}
+
+		// 6. Add guidance rules (if present)
+		if (input.guidance && input.guidance.length > 0) {
+			components.push("guidance-rules");
+		}
+
+		return {
+			systemPrompt,
+			userPrompt: parts.join("\n\n"),
+			metadata: {
+				components,
+				subroutineName,
+				promptType,
+				isNewSession: true,
+				isStreaming: false,
+			},
+		};
+	}
+
+	/**
+	 * Build prompt for existing session continuation - user comment and attachments only
+	 */
+	private buildContinuationPrompt(input: PromptAssemblyInput): PromptAssembly {
+		const components: PromptComponent[] = ["user-comment"];
+		if (input.attachmentManifest) {
+			components.push("attachment-manifest");
+		}
+
+		// Wrap comment in XML with author and timestamp for multi-player context
+		const author = input.commentAuthor || "Unknown";
+		const timestamp = input.commentTimestamp || new Date().toISOString();
+
+		const commentXml = `<new_comment>
+  <author>${author}</author>
+  <timestamp>${timestamp}</timestamp>
+  <content>
+${input.userComment}
+  </content>
+</new_comment>`;
+
+		const parts: string[] = [commentXml];
+		if (input.attachmentManifest) {
+			parts.push(input.attachmentManifest);
+		}
+
+		return {
+			systemPrompt: undefined,
+			userPrompt: parts.join("\n\n"),
+			metadata: {
+				components,
+				promptType: "continuation",
+				isNewSession: false,
+				isStreaming: false,
+			},
+		};
+	}
+
+	/**
+	 * Determine the prompt type based on input flags and system prompt availability
+	 */
+	private determinePromptType(
+		input: PromptAssemblyInput,
+		hasSystemPrompt: boolean,
+	): PromptType {
+		if (input.isMentionTriggered && input.isLabelBasedPromptRequested) {
+			return "label-based-prompt-command";
+		}
+		if (input.isMentionTriggered) {
+			return "mention";
+		}
+		if (hasSystemPrompt) {
+			return "label-based";
+		}
+		return "fallback";
+	}
+
+	/**
+	 * Load a subroutine prompt file
+	 * Extracted helper to make prompt assembly more readable
+	 */
+	private async loadSubroutinePrompt(
+		subroutine: SubroutineDefinition,
+	): Promise<string | null> {
+		// Skip loading for "primary" - it's a placeholder that doesn't have a file
+		if (subroutine.promptPath === "primary") {
+			return null;
+		}
+
+		const __filename = fileURLToPath(import.meta.url);
+		const __dirname = dirname(__filename);
+		const subroutinePromptPath = join(
+			__dirname,
+			"prompts",
+			subroutine.promptPath,
+		);
+
+		try {
+			const prompt = await readFile(subroutinePromptPath, "utf-8");
+			console.log(
+				`[EdgeWorker] Loaded ${subroutine.name} subroutine prompt (${prompt.length} characters)`,
+			);
+			return prompt;
+		} catch (error) {
+			console.warn(
+				`[EdgeWorker] Failed to load subroutine prompt from ${subroutinePromptPath}:`,
+				error,
+			);
+			return null;
+		}
+	}
+
+	/**
+	 * Load shared instructions that get appended to all system prompts
+	 */
+	private async loadSharedInstructions(): Promise<string> {
+		const __filename = fileURLToPath(import.meta.url);
+		const __dirname = dirname(__filename);
+		const instructionsPath = join(
+			__dirname,
+			"..",
+			"prompts",
+			"todolist-system-prompt-extension.md",
+		);
+
+		try {
+			const instructions = await readFile(instructionsPath, "utf-8");
+			return instructions;
+		} catch (error) {
+			console.error(
+				`[EdgeWorker] Failed to load shared instructions from ${instructionsPath}:`,
+				error,
+			);
+			return ""; // Return empty string if file can't be loaded
+		}
+	}
+
+	/**
+	 * Adapter method for prompt assembly - extracts just the prompt string
+	 */
+	private async determineSystemPromptForAssembly(
+		labels: string[],
+		repository: RepositoryConfig,
+	): Promise<string | undefined> {
+		const result = await this.determineSystemPromptFromLabels(
+			labels,
+			repository,
+		);
+		return result?.prompt;
+	}
+
+	/**
+	 * Adapter method for prompt assembly - routes to appropriate issue context builder
+	 */
+	private async buildIssueContextForPromptAssembly(
+		issue: LinearIssue,
+		repository: RepositoryConfig,
+		promptType: PromptType,
+		attachmentManifest?: string,
+		guidance?: LinearWebhookGuidanceRule[],
+		agentSession?: LinearWebhookAgentSession,
+	): Promise<IssueContextResult> {
+		// Delegate to appropriate builder based on promptType
+		if (promptType === "mention") {
+			if (!agentSession) {
+				throw new Error(
+					"agentSession is required for mention-triggered prompts",
+				);
+			}
+			return this.buildMentionPrompt(
+				issue,
+				agentSession,
+				attachmentManifest,
+				guidance,
+			);
+		}
+		if (
+			promptType === "label-based" ||
+			promptType === "label-based-prompt-command"
+		) {
+			return this.buildLabelBasedPrompt(
+				issue,
+				repository,
+				attachmentManifest,
+				guidance,
+			);
+		}
+		// Fallback to standard issue context
+		return this.buildIssueContextPrompt(
+			issue,
+			repository,
+			undefined, // No new comment for initial prompt assembly
+			attachmentManifest,
+			guidance,
+		);
 	}
 
 	/**
@@ -3528,6 +5446,7 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		disallowedTools: string[],
 		resumeSessionId?: string,
 		labels?: string[],
+		maxTurns?: number,
 	): ClaudeRunnerConfig {
 		// Configure PostToolUse hook for playwright screenshots
 		const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
@@ -3590,7 +5509,6 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 			}
 		}
 
-		const claudeDefaultConfig = this.config.cliDefaults?.claude;
 		const config = {
 			workingDirectory: session.workspace.path,
 			allowedTools,
@@ -3601,18 +5519,11 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 			mcpConfigPath: repository.mcpConfigPath,
 			mcpConfig: this.buildMcpConfig(repository, linearAgentActivitySessionId),
 			appendSystemPrompt: systemPrompt || "",
-			// Priority order: label override > repo runner models > repo legacy config > global CLI defaults > legacy global defaults
-			model:
-				modelOverride ||
-				repository.runnerModels?.claude?.model ||
-				repository.model ||
-				claudeDefaultConfig?.model ||
-				this.config.defaultModel,
+			// Priority order: label override > repository config > global default
+			model: modelOverride || repository.model || this.config.defaultModel,
 			fallbackModel:
 				fallbackModelOverride ||
-				repository.runnerModels?.claude?.fallbackModel ||
 				repository.fallbackModel ||
-				claudeDefaultConfig?.fallbackModel ||
 				this.config.defaultFallbackModel,
 			hooks,
 			onMessage: (message: SDKMessage) => {
@@ -3629,6 +5540,10 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 			(config as any).resumeSessionId = resumeSessionId;
 		}
 
+		if (maxTurns !== undefined) {
+			(config as any).maxTurns = maxTurns;
+		}
+
 		return config;
 	}
 
@@ -3637,23 +5552,15 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 	 */
 	private buildDisallowedTools(
 		repository: RepositoryConfig,
-		promptType?: string,
+		promptType?: "debugger" | "builder" | "scoper" | "orchestrator",
 	): string[] {
 		let disallowedTools: string[] = [];
 		let toolSource = "";
 
 		// Priority order (same as allowedTools):
 		// 1. Repository-specific prompt type configuration
-		const promptConfig = promptType
-			? repository.labelPrompts?.[promptType]
-			: undefined;
-		if (
-			promptType &&
-			promptConfig &&
-			!Array.isArray(promptConfig) &&
-			promptConfig.disallowedTools
-		) {
-			disallowedTools = promptConfig.disallowedTools;
+		if (promptType && repository.labelPrompts?.[promptType]?.disallowedTools) {
+			disallowedTools = repository.labelPrompts[promptType].disallowedTools;
 			toolSource = `repository label prompt (${promptType})`;
 		}
 		// 2. Global prompt type defaults
@@ -3694,23 +5601,20 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 	 */
 	private buildAllowedTools(
 		repository: RepositoryConfig,
-		promptType?: string,
+		promptType?: "debugger" | "builder" | "scoper" | "orchestrator",
 	): string[] {
 		let baseTools: string[] = [];
 		let toolSource = "";
+		let includeSafeAllowlist = false;
 
 		// Priority order:
 		// 1. Repository-specific prompt type configuration
-		const promptConfig = promptType
-			? repository.labelPrompts?.[promptType]
-			: undefined;
-		if (
-			promptType &&
-			promptConfig &&
-			!Array.isArray(promptConfig) &&
-			promptConfig.allowedTools
-		) {
-			baseTools = this.resolveToolPreset(promptConfig.allowedTools);
+		if (promptType && repository.labelPrompts?.[promptType]?.allowedTools) {
+			const allowed = repository.labelPrompts[promptType].allowedTools;
+			if (typeof allowed === "string" && allowed.toLowerCase() === "safe") {
+				includeSafeAllowlist = true;
+			}
+			baseTools = this.resolveToolPreset(allowed);
 			toolSource = `repository label prompt (${promptType})`;
 		}
 		// 2. Global prompt type defaults
@@ -3718,9 +5622,11 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 			promptType &&
 			this.config.promptDefaults?.[promptType]?.allowedTools
 		) {
-			baseTools = this.resolveToolPreset(
-				this.config.promptDefaults[promptType].allowedTools,
-			);
+			const allowed = this.config.promptDefaults[promptType].allowedTools;
+			if (typeof allowed === "string" && allowed.toLowerCase() === "safe") {
+				includeSafeAllowlist = true;
+			}
+			baseTools = this.resolveToolPreset(allowed);
 			toolSource = `global prompt defaults (${promptType})`;
 		}
 		// 3. Repository-level allowed tools
@@ -3737,6 +5643,7 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		else {
 			baseTools = getSafeTools();
 			toolSource = "safe tools fallback";
+			includeSafeAllowlist = true;
 		}
 
 		// Linear MCP tools that should always be available
@@ -3744,7 +5651,11 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		const linearMcpTools = ["mcp__linear", "mcp__cyrus-tools"];
 
 		// Combine and deduplicate
-		const allTools = [...new Set([...baseTools, ...linearMcpTools])];
+		const combinedTools = includeSafeAllowlist
+			? [...baseTools, ...SAFE_BASH_TOOL_ALLOWLIST]
+			: baseTools;
+
+		const allTools = [...new Set([...combinedTools, ...linearMcpTools])];
 
 		console.log(
 			`[EdgeWorker] Tool selection for ${repository.name}: ${allTools.length} tools from ${toolSource}`,
@@ -3825,25 +5736,31 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		const childToParentAgentSession = Object.fromEntries(
 			this.childToParentAgentSession.entries(),
 		);
-		const sessionRunnerSelections: Record<
-			string,
-			SerializedSessionRunnerSelection
-		> = {};
-		for (const [
-			sessionId,
-			metadata,
-		] of this.sessionRunnerSelections.entries()) {
-			sessionRunnerSelections[sessionId] = { ...metadata };
-		}
-		const finalizedNonClaudeSessions = Array.from(
-			this.finalizedNonClaudeSessions.values(),
+
+		const sessionRunnerSelections = Object.fromEntries(
+			Array.from(this.sessionRunnerSelections.entries()).map(
+				([sessionId, metadata]) => [
+					sessionId,
+					{
+						type: metadata.type,
+						model: metadata.model,
+						issueId: metadata.issueId,
+						resumeSessionId: metadata.resumeSessionId,
+						promptType: this.normalizePromptType(metadata.promptType),
+						codexPermissions: metadata.codexPermissions,
+					},
+				],
+			),
 		);
+
 		const codexSessionCache = Object.fromEntries(
 			this.codexSessionCache.entries(),
 		);
-		const stopRequestedSessions = Array.from(
-			this.stopRequestedSessions.values(),
+
+		const finalizedNonClaudeSessions = Array.from(
+			this.finalizedNonClaudeSessions,
 		);
+		const stopRequestedSessions = Array.from(this.stopRequestedSessions);
 
 		return {
 			agentSessions,
@@ -3895,44 +5812,46 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		}
 
 		if (state.sessionRunnerSelections) {
-			this.sessionRunnerSelections.clear();
-			let restoredCount = 0;
-			for (const [sessionId, metadata] of Object.entries(
-				state.sessionRunnerSelections,
-			)) {
-				const runner = this.normalizeRunnerType(metadata.type, {
-					scope: "restore.sessionRunnerSelection",
-					repositoryId: metadata.issueId,
-				});
-				if (!runner) {
-					continue;
-				}
-				this.sessionRunnerSelections.set(sessionId, {
-					...metadata,
-					type: runner,
-				});
-				restoredCount += 1;
-			}
-			console.log(
-				`[EdgeWorker] Restored runner selections for ${restoredCount} sessions`,
+			this.sessionRunnerSelections = new Map(
+				Object.entries(state.sessionRunnerSelections).map(
+					([sessionId, selection]) => [
+						sessionId,
+						{
+							type: selection.type,
+							model: selection.model,
+							issueId: selection.issueId,
+							resumeSessionId: selection.resumeSessionId,
+							promptType: this.normalizePromptType(selection.promptType),
+							codexPermissions: selection.codexPermissions,
+						},
+					],
+				),
 			);
+			console.log(
+				`[EdgeWorker] Restored ${this.sessionRunnerSelections.size} session runner selections`,
+			);
+		} else {
+			this.sessionRunnerSelections = new Map();
+		}
+
+		if (state.codexSessionCache) {
+			this.codexSessionCache = new Map(Object.entries(state.codexSessionCache));
+		} else {
+			this.codexSessionCache = new Map();
 		}
 
 		if (state.finalizedNonClaudeSessions) {
 			this.finalizedNonClaudeSessions = new Set(
 				state.finalizedNonClaudeSessions,
 			);
-		}
-
-		if (state.codexSessionCache) {
-			this.codexSessionCache = new Map(Object.entries(state.codexSessionCache));
-			console.log(
-				`[EdgeWorker] Restored ${this.codexSessionCache.size} codex session cache entries`,
-			);
+		} else {
+			this.finalizedNonClaudeSessions = new Set();
 		}
 
 		if (state.stopRequestedSessions) {
 			this.stopRequestedSessions = new Set(state.stopRequestedSessions);
+		} else {
+			this.stopRequestedSessions = new Set();
 		}
 	}
 
@@ -3943,25 +5862,11 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		linearAgentActivitySessionId: string,
 		repositoryId: string,
 	): Promise<void> {
-		const linearClient = this.linearClients.get(repositoryId);
-		if (!linearClient) {
-			console.warn(
-				`[EdgeWorker] No Linear client found for repository ${repositoryId}`,
-			);
-			return;
-		}
-
-		const acknowledgment =
-			"I've received your request and I'm starting to work on it. Let me analyze the issue and prepare my approach.";
-
 		try {
 			await this.postResponse(
 				linearAgentActivitySessionId,
 				repositoryId,
-				acknowledgment,
-			);
-			console.log(
-				`[EdgeWorker] Posted instant acknowledgment response for session ${linearAgentActivitySessionId}`,
+				"I've received your request and I'm starting to work on it. Let me analyze the issue and prepare my approach.",
 			);
 		} catch (error) {
 			console.error(
@@ -3969,706 +5874,6 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 				error,
 			);
 		}
-	}
-
-	private enqueueCodexLinearActivity(
-		sessionId: string,
-		task: () => Promise<void>,
-	): Promise<void> {
-		const previous =
-			this.codexActivityQueue.get(sessionId) ?? Promise.resolve();
-
-		const queuedTask = previous
-			.catch((error) => {
-				this.debugLog("[enqueueCodexLinearActivity] Previous task failed", {
-					sessionId,
-					error,
-				});
-			})
-			.then(() => task())
-			.catch((error) => {
-				this.debugLog("[enqueueCodexLinearActivity] Task failed", {
-					sessionId,
-					error,
-				});
-			})
-			.finally(() => {
-				if (this.codexActivityQueue.get(sessionId) === queuedTask) {
-					this.codexActivityQueue.delete(sessionId);
-				}
-			});
-
-		this.codexActivityQueue.set(sessionId, queuedTask);
-		return queuedTask;
-	}
-
-	private formatInlineErrorMessage(message: string): string {
-		const trimmed = (message ?? "").trim();
-		if (trimmed.length === 0) {
-			return "❌ Error encountered.";
-		}
-		return trimmed.startsWith("❌") ? trimmed : `❌ ${trimmed}`;
-	}
-
-	private async postThought(
-		linearAgentActivitySessionId: string,
-		repositoryId: string,
-		body: string,
-	): Promise<void> {
-		const linearClient = this.linearClients.get(repositoryId);
-		if (!linearClient) {
-			this.debugLog(
-				`[postThought] No Linear client found for repository ${repositoryId}`,
-			);
-			return;
-		}
-
-		try {
-			await linearClient.createAgentActivity({
-				agentSessionId: linearAgentActivitySessionId,
-				content: {
-					type: "thought",
-					body,
-				},
-			});
-		} catch (error) {
-			console.error(
-				`[EdgeWorker] Failed to post thought for session ${linearAgentActivitySessionId}:`,
-				error,
-			);
-		}
-	}
-
-	private async postResponse(
-		linearAgentActivitySessionId: string,
-		repositoryId: string,
-		body: string,
-	): Promise<void> {
-		const linearClient = this.linearClients.get(repositoryId);
-		if (!linearClient) {
-			this.debugLog(
-				`[postResponse] No Linear client found for repository ${repositoryId}`,
-			);
-			return;
-		}
-
-		this.debugLog("[postResponse] Posting response", {
-			sessionId: linearAgentActivitySessionId,
-			repositoryId,
-			preview: body.slice(0, 200),
-		});
-
-		try {
-			await linearClient.createAgentActivity({
-				agentSessionId: linearAgentActivitySessionId,
-				content: {
-					type: "response",
-					body,
-				},
-			});
-			this.debugLog("[postResponse] Response posted", {
-				sessionId: linearAgentActivitySessionId,
-				repositoryId,
-			});
-		} catch (error) {
-			console.error(
-				`[EdgeWorker] Failed to post response for session ${linearAgentActivitySessionId}:`,
-				error,
-			);
-			this.debugLog("[postResponse] Error posting response", {
-				sessionId: linearAgentActivitySessionId,
-				repositoryId,
-				error,
-			});
-		}
-	}
-
-	private async postAction(
-		linearAgentActivitySessionId: string,
-		repositoryId: string,
-		action: string,
-		detail?: string,
-	): Promise<void> {
-		const linearClient = this.linearClients.get(repositoryId);
-		if (!linearClient) {
-			this.debugLog(
-				`[postAction] No Linear client found for repository ${repositoryId}`,
-			);
-			return;
-		}
-
-		const parameter = detail?.trim();
-		this.debugLog("[postAction] Posting action", {
-			sessionId: linearAgentActivitySessionId,
-			repositoryId,
-			action,
-			parameterPreview: parameter?.slice(0, 200),
-		});
-
-		try {
-			await linearClient.createAgentActivity({
-				agentSessionId: linearAgentActivitySessionId,
-				content: {
-					type: "action",
-					action,
-					parameter: parameter && parameter.length > 0 ? parameter : undefined,
-				},
-			});
-			this.debugLog("[postAction] Action posted", {
-				sessionId: linearAgentActivitySessionId,
-				repositoryId,
-			});
-		} catch (error) {
-			console.error(
-				`[EdgeWorker] Failed to post action for session ${linearAgentActivitySessionId}:`,
-				error,
-			);
-			this.debugLog("[postAction] Error posting action", {
-				sessionId: linearAgentActivitySessionId,
-				repositoryId,
-				error,
-			});
-		}
-	}
-
-	private async postError(
-		linearAgentActivitySessionId: string,
-		repositoryId: string,
-		body: string,
-	): Promise<void> {
-		const linearClient = this.linearClients.get(repositoryId);
-		if (!linearClient) {
-			this.debugLog(
-				`[postError] No Linear client found for repository ${repositoryId}`,
-			);
-			return;
-		}
-
-		this.debugLog("[postError] Posting error", {
-			sessionId: linearAgentActivitySessionId,
-			repositoryId,
-			messagePreview: body.slice(0, 200),
-		});
-
-		try {
-			await linearClient.createAgentActivity({
-				agentSessionId: linearAgentActivitySessionId,
-				content: {
-					type: "error",
-					body,
-				},
-			});
-			this.debugLog("[postError] Error posted", {
-				sessionId: linearAgentActivitySessionId,
-				repositoryId,
-			});
-		} catch (error) {
-			console.error(
-				`[EdgeWorker] Failed to post error for session ${linearAgentActivitySessionId}:`,
-				error,
-			);
-			this.debugLog("[postError] Error posting failure", {
-				sessionId: linearAgentActivitySessionId,
-				repositoryId,
-				error,
-			});
-		}
-	}
-
-	private async markSessionComplete(
-		linearAgentActivitySessionId: string,
-		repositoryId: string,
-	): Promise<void> {
-		this.debugLog(
-			`[markSessionComplete] Session finalized for ${repositoryId}`,
-			{ sessionId: linearAgentActivitySessionId },
-		);
-		void this.savePersistedState().catch((error) => {
-			this.debugLog(
-				"[markSessionComplete] Failed to persist completion state",
-				error,
-			);
-		});
-	}
-
-	private async startNonClaudeRunner({
-		selection,
-		repository,
-		prompt,
-		workspacePath,
-		linearAgentActivitySessionId,
-		issueIdentifier,
-		isFollowUp = false,
-	}: {
-		selection: RunnerSelection;
-		repository: RepositoryConfig;
-		prompt: string;
-		workspacePath: string;
-		linearAgentActivitySessionId: string;
-		issueIdentifier: string;
-		isFollowUp?: boolean;
-	}): Promise<void> {
-		if (selection.type === "claude") {
-			throw new Error("startNonClaudeRunner called with Claude selection");
-		}
-
-		const codexDefaults = this.config.cliDefaults?.codex;
-		const repoRunnerModels = repository.runnerModels;
-		let selectionMeta = this.sessionRunnerSelections.get(
-			linearAgentActivitySessionId,
-		);
-
-		let runnerConfig: any;
-
-		if (selection.type === "codex") {
-			const env = { ...process.env };
-			const apiKey = this.getOpenAiApiKey();
-			if (apiKey && !env.OPENAI_API_KEY) {
-				env.OPENAI_API_KEY = apiKey;
-			}
-			if (!isFollowUp) {
-				this.codexSessionCache.delete(linearAgentActivitySessionId);
-			}
-			const cachedResumeId = this.codexSessionCache.get(
-				linearAgentActivitySessionId,
-			);
-			const resumeSessionId = isFollowUp
-				? cachedResumeId || selectionMeta?.resumeSessionId
-				: undefined;
-			let codexPermissions =
-				selection.codexPermissions || selectionMeta?.codexPermissions;
-			if (!codexPermissions) {
-				codexPermissions = this.deriveCodexPermissions(
-					repository,
-					selection.promptType,
-				);
-			}
-			const approvalPolicy =
-				codexPermissions?.approvalPolicy ||
-				codexDefaults?.approvalPolicy ||
-				"never";
-			const sandbox =
-				codexPermissions?.sandbox ||
-				codexDefaults?.sandbox ||
-				"danger-full-access";
-			const fullAuto =
-				codexPermissions?.fullAuto ?? codexDefaults?.fullAuto ?? false;
-			runnerConfig = {
-				type: "codex",
-				cwd: workspacePath,
-				prompt,
-				model:
-					selection.model ||
-					repoRunnerModels?.codex?.model ||
-					codexDefaults?.model,
-				approvalPolicy,
-				sandbox,
-				fullAuto,
-				...(resumeSessionId && { resumeSessionId }),
-				env,
-			};
-			if (
-				codexPermissions &&
-				selectionMeta &&
-				!selectionMeta.codexPermissions
-			) {
-				selectionMeta = {
-					...selectionMeta,
-					codexPermissions,
-				};
-				this.sessionRunnerSelections.set(
-					linearAgentActivitySessionId,
-					selectionMeta,
-				);
-			}
-		} else {
-			throw new Error(
-				`Unsupported non-Claude runner type: ${selection.type as string}`,
-			);
-		}
-
-		// Clear any stale stop flag when a fresh runner starts
-		this.stopRequestedSessions.delete(linearAgentActivitySessionId);
-
-		this.debugLog(`[startNonClaudeRunner] Starting ${selection.type} runner`, {
-			sessionId: linearAgentActivitySessionId,
-			issueIdentifier,
-			isFollowUp,
-			spawn: {
-				type: selection.type,
-				cwd: workspacePath,
-				model: runnerConfig.model,
-			},
-		});
-
-		this.finalizedNonClaudeSessions.delete(linearAgentActivitySessionId);
-		void this.savePersistedState().catch((error) => {
-			this.debugLog(
-				"[startNonClaudeRunner] Failed to persist cleared finalized state",
-				error,
-			);
-		});
-
-		const runner = this.runnerFactory.create(runnerConfig);
-		this.nonClaudeRunners.set(linearAgentActivitySessionId, runner);
-
-		const handleEvent = (event: RunnerEvent): void => {
-			switch (event.kind) {
-				case "session": {
-					if (selection.type === "codex") {
-						this.codexSessionCache.set(linearAgentActivitySessionId, event.id);
-						const meta = this.sessionRunnerSelections.get(
-							linearAgentActivitySessionId,
-						);
-						this.debugLog(
-							"[startNonClaudeRunner] Session resume metadata before update",
-							{ sessionId: linearAgentActivitySessionId, meta },
-						);
-						if (meta && meta.resumeSessionId !== event.id) {
-							const updatedMeta = { ...meta, resumeSessionId: event.id };
-							this.sessionRunnerSelections.set(
-								linearAgentActivitySessionId,
-								updatedMeta,
-							);
-							void this.savePersistedState().catch((error) => {
-								this.debugLog(
-									"[startNonClaudeRunner] Failed to persist codex session id",
-									error,
-								);
-							});
-						}
-						this.debugLog("[startNonClaudeRunner] Captured codex session id", {
-							sessionId: linearAgentActivitySessionId,
-							codexSessionId: event.id,
-						});
-					}
-					return;
-				}
-				case "thought": {
-					if (
-						this.finalizedNonClaudeSessions.has(linearAgentActivitySessionId)
-					) {
-						this.debugLog(
-							`[startNonClaudeRunner] Suppressing thought after final (${selection.type})`,
-							{ sessionId: linearAgentActivitySessionId },
-						);
-						return;
-					}
-					const text = event.text.trim();
-					if (text.length === 0) {
-						return;
-					}
-					const postThoughtTask = async (): Promise<void> => {
-						try {
-							await this.postThought(
-								linearAgentActivitySessionId,
-								repository.id,
-								text,
-							);
-						} catch (error) {
-							this.debugLog(
-								`[startNonClaudeRunner] Failed posting thought (${selection.type})`,
-								error,
-							);
-						}
-					};
-					if (selection.type === "codex") {
-						void this.enqueueCodexLinearActivity(
-							linearAgentActivitySessionId,
-							postThoughtTask,
-						);
-					} else {
-						void postThoughtTask();
-					}
-					return;
-				}
-				case "action": {
-					const actionName = event.name?.trim() || "codex action";
-					const icon = event.icon?.trim() || "🛠️";
-					const actionLabel =
-						icon.length > 0 ? `${icon} ${actionName}` : actionName;
-					this.debugLog(
-						`[startNonClaudeRunner] Action event from ${selection.type}`,
-						{
-							sessionId: linearAgentActivitySessionId,
-							name: actionName,
-							itemType: event.itemType,
-							detail: event.detail,
-						},
-					);
-					const postActionTask = async (): Promise<void> => {
-						try {
-							await this.postAction(
-								linearAgentActivitySessionId,
-								repository.id,
-								actionLabel,
-								event.detail,
-							);
-						} catch (error) {
-							this.debugLog(
-								`[startNonClaudeRunner] Failed posting action (${selection.type})`,
-								error,
-							);
-						}
-					};
-					if (selection.type === "codex") {
-						void this.enqueueCodexLinearActivity(
-							linearAgentActivitySessionId,
-							postActionTask,
-						);
-					} else {
-						void postActionTask();
-					}
-					return;
-				}
-				case "log": {
-					this.debugLog(`[startNonClaudeRunner] Log from ${selection.type}`, {
-						sessionId: linearAgentActivitySessionId,
-						message: event.text,
-					});
-					return;
-				}
-				case "response": {
-					const text = event.text.trim();
-					if (text.length === 0) {
-						return;
-					}
-					const postResponseTask = async (): Promise<void> => {
-						try {
-							await this.postResponse(
-								linearAgentActivitySessionId,
-								repository.id,
-								text,
-							);
-						} catch (error) {
-							this.debugLog(
-								`[startNonClaudeRunner] Failed posting response (${selection.type})`,
-								error,
-							);
-						}
-					};
-					if (selection.type === "codex") {
-						void this.enqueueCodexLinearActivity(
-							linearAgentActivitySessionId,
-							postResponseTask,
-						);
-					} else {
-						void postResponseTask();
-					}
-					return;
-				}
-				case "final": {
-					if (
-						this.finalizedNonClaudeSessions.has(linearAgentActivitySessionId)
-					) {
-						this.debugLog(
-							`[startNonClaudeRunner] Ignoring duplicate final (${selection.type})`,
-							{ sessionId: linearAgentActivitySessionId },
-						);
-						return;
-					}
-					this.finalizedNonClaudeSessions.add(linearAgentActivitySessionId);
-					void this.savePersistedState().catch((error) => {
-						this.debugLog(
-							"[startNonClaudeRunner] Failed to persist finalized state",
-							error,
-						);
-					});
-					void (async () => {
-						await this.safeStopRunner(linearAgentActivitySessionId, runner);
-						const text = event.text.trim();
-						if (text.length > 0) {
-							const postFinalResponse = async (): Promise<void> => {
-								try {
-									await this.postResponse(
-										linearAgentActivitySessionId,
-										repository.id,
-										text,
-									);
-								} catch (error) {
-									this.debugLog(
-										`[startNonClaudeRunner] Failed posting final response (${selection.type})`,
-										error,
-									);
-								}
-							};
-							if (selection.type === "codex") {
-								await this.enqueueCodexLinearActivity(
-									linearAgentActivitySessionId,
-									postFinalResponse,
-								);
-							} else {
-								await postFinalResponse();
-							}
-						}
-						try {
-							await this.markSessionComplete(
-								linearAgentActivitySessionId,
-								repository.id,
-							);
-						} catch (error) {
-							this.debugLog(
-								`[startNonClaudeRunner] Failed completing session (${selection.type})`,
-								error,
-							);
-						}
-					})();
-					return;
-				}
-				case "error": {
-					if (
-						this.finalizedNonClaudeSessions.has(linearAgentActivitySessionId)
-					) {
-						this.debugLog(
-							`[startNonClaudeRunner] Suppressing error after final (${selection.type})`,
-							{ message: event.error.message },
-						);
-						return;
-					}
-					// Suppress error emission if this session was intentionally stopped
-					if (this.stopRequestedSessions.has(linearAgentActivitySessionId)) {
-						this.debugLog(
-							`[startNonClaudeRunner] Suppressing error after intentional stop (${selection.type})`,
-							{ message: event.error.message },
-						);
-						this.stopRequestedSessions.delete(linearAgentActivitySessionId);
-						void this.safeStopRunner(linearAgentActivitySessionId, runner);
-						return;
-					}
-					const errorWithCause = event.error as Error & { cause?: unknown };
-					const hasEmbeddedCause =
-						errorWithCause.cause !== undefined && errorWithCause.cause !== null;
-					if (!hasEmbeddedCause) {
-						void this.safeStopRunner(linearAgentActivitySessionId, runner);
-					}
-					const err = this.normalizeError(
-						event.error,
-						`${selection.type} runner error`,
-					);
-					const postLinearActivity = async (): Promise<void> => {
-						try {
-							if (hasEmbeddedCause) {
-								await this.postThought(
-									linearAgentActivitySessionId,
-									repository.id,
-									this.formatInlineErrorMessage(err.message),
-								);
-							} else {
-								await this.postError(
-									linearAgentActivitySessionId,
-									repository.id,
-									err.message,
-								);
-							}
-						} catch (postError) {
-							this.debugLog(
-								`[startNonClaudeRunner] Failed posting ${
-									hasEmbeddedCause ? "inline error thought" : "error"
-								} (${selection.type})`,
-								postError,
-							);
-						}
-					};
-					if (selection.type === "codex") {
-						void this.enqueueCodexLinearActivity(
-							linearAgentActivitySessionId,
-							postLinearActivity,
-						);
-					} else {
-						void postLinearActivity();
-					}
-					return;
-				}
-			}
-		};
-
-		try {
-			const startResult = await runner.start(handleEvent);
-			if (startResult.capabilities?.jsonStream) {
-				this.debugLog(
-					`[startNonClaudeRunner] ${selection.type} runner enabled JSON stream`,
-					{ sessionId: linearAgentActivitySessionId },
-				);
-			}
-			if (selection.type === "codex" && startResult.sessionId) {
-				this.codexSessionCache.set(
-					linearAgentActivitySessionId,
-					startResult.sessionId,
-				);
-				if (selectionMeta) {
-					this.sessionRunnerSelections.set(linearAgentActivitySessionId, {
-						...selectionMeta,
-						resumeSessionId: startResult.sessionId,
-					});
-				}
-			}
-		} catch (error) {
-			this.nonClaudeRunners.delete(linearAgentActivitySessionId);
-			const err = this.normalizeError(
-				error,
-				`Failed to start ${selection.type} runner`,
-			);
-			await this.postError(
-				linearAgentActivitySessionId,
-				repository.id,
-				err.message,
-			);
-			throw err;
-		}
-	}
-
-	private async handleNonClaudeFollowUp({
-		selection,
-		session,
-		repository,
-		promptBody,
-		attachmentManifest,
-		linearAgentActivitySessionId,
-		isNewSession,
-	}: {
-		selection: SessionRunnerMetadata;
-		session: CyrusAgentSession;
-		repository: RepositoryConfig;
-		promptBody: string;
-		attachmentManifest: string;
-		linearAgentActivitySessionId: string;
-		isNewSession: boolean;
-	}): Promise<void> {
-		const existingRunner = this.nonClaudeRunners.get(
-			linearAgentActivitySessionId,
-		);
-		if (existingRunner) {
-			await this.safeStopRunner(linearAgentActivitySessionId, existingRunner);
-		}
-
-		const fullIssue = await this.fetchFullIssueDetails(
-			session.issueId,
-			repository.id,
-		);
-		if (!fullIssue) {
-			throw new Error(
-				`Failed to fetch full issue details for follow-up session ${session.issueId}`,
-			);
-		}
-
-		const followUpPrompt = await this.buildSessionPrompt(
-			isNewSession,
-			fullIssue,
-			repository,
-			promptBody,
-			attachmentManifest,
-		);
-
-		const { issueId: _issueId, ...runnerSelection } = selection;
-		await this.startNonClaudeRunner({
-			selection: runnerSelection,
-			repository,
-			prompt: followUpPrompt,
-			workspacePath: session.workspace.path,
-			linearAgentActivitySessionId,
-			issueIdentifier: fullIssue.identifier,
-			isFollowUp: true,
-		});
 	}
 
 	/**
@@ -4712,6 +5917,308 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 				error,
 			);
 		}
+	}
+
+	/**
+	 * Re-route procedure for a session (used when resuming from child or give feedback)
+	 * This ensures the currentSubroutine is reset to avoid suppression issues
+	 */
+	private async rerouteProcedureForSession(
+		session: CyrusAgentSession,
+		linearAgentActivitySessionId: string,
+		agentSessionManager: AgentSessionManager,
+		promptBody: string,
+		repository: RepositoryConfig,
+	): Promise<void> {
+		// Initialize procedure metadata using intelligent routing
+		if (!session.metadata) {
+			session.metadata = {};
+		}
+
+		// Post ephemeral "Routing..." thought
+		if (typeof agentSessionManager.postRoutingThought === "function") {
+			await agentSessionManager.postRoutingThought(
+				linearAgentActivitySessionId,
+			);
+		}
+
+		// Fetch full issue and labels to check for Orchestrator label override
+		const linearClient = this.linearClients.get(repository.id);
+		let hasOrchestratorLabel = false;
+
+		if (linearClient) {
+			try {
+				const fullIssue = await linearClient.issue(session.issueId);
+				const labels = await this.fetchIssueLabels(fullIssue);
+
+				// Check for Orchestrator label (same logic as initial routing)
+				const orchestratorConfig = repository.labelPrompts?.orchestrator;
+				const orchestratorLabels = Array.isArray(orchestratorConfig)
+					? orchestratorConfig
+					: orchestratorConfig?.labels;
+				hasOrchestratorLabel =
+					orchestratorLabels?.some((label) => labels.includes(label)) || false;
+			} catch (error) {
+				console.error(
+					`[EdgeWorker] Failed to fetch issue labels for routing:`,
+					error,
+				);
+				// Continue with AI routing if label fetch fails
+			}
+		}
+
+		let selectedProcedure: ProcedureDefinition;
+		let finalClassification: RequestClassification;
+
+		// If Orchestrator label is present, ALWAYS use orchestrator-full procedure
+		if (hasOrchestratorLabel) {
+			const orchestratorProcedure =
+				this.procedureRouter.getProcedure("orchestrator-full");
+			if (!orchestratorProcedure) {
+				throw new Error("orchestrator-full procedure not found in registry");
+			}
+			selectedProcedure = orchestratorProcedure;
+			finalClassification = "orchestrator";
+			console.log(
+				`[EdgeWorker] Using orchestrator-full procedure due to Orchestrator label (skipping AI routing)`,
+			);
+		} else {
+			// No Orchestrator label - use AI routing based on prompt content
+			const routingDecision = await this.procedureRouter.determineRoutine(
+				promptBody.trim(),
+			);
+			selectedProcedure = routingDecision.procedure;
+			finalClassification = routingDecision.classification;
+
+			// Log AI routing decision
+			console.log(
+				`[EdgeWorker] AI routing decision for ${linearAgentActivitySessionId}:`,
+			);
+			console.log(`  Classification: ${routingDecision.classification}`);
+			console.log(`  Procedure: ${selectedProcedure.name}`);
+			console.log(`  Reasoning: ${routingDecision.reasoning}`);
+		}
+
+		// Initialize procedure metadata in session (resets currentSubroutine)
+		this.procedureRouter.initializeProcedureMetadata(
+			session,
+			selectedProcedure,
+		);
+
+		// Post procedure selection result (replaces ephemeral routing thought)
+		if (
+			typeof agentSessionManager.postProcedureSelectionThought === "function"
+		) {
+			await agentSessionManager.postProcedureSelectionThought(
+				linearAgentActivitySessionId,
+				selectedProcedure.name,
+				finalClassification,
+			);
+		}
+	}
+
+	/**
+	 * Handle prompt with streaming check - centralized logic for all input types
+	 *
+	 * This method implements the unified pattern for handling prompts:
+	 * 1. Check if runner is actively streaming
+	 * 2. Route procedure if NOT streaming (resets currentSubroutine)
+	 * 3. Add to stream if streaming, OR resume session if not
+	 *
+	 * @param session The Cyrus agent session
+	 * @param repository Repository configuration
+	 * @param linearAgentActivitySessionId Linear agent activity session ID
+	 * @param agentSessionManager Agent session manager instance
+	 * @param promptBody The prompt text to send
+	 * @param attachmentManifest Optional attachment manifest to append
+	 * @param isNewSession Whether this is a new session
+	 * @param additionalAllowedDirs Additional directories to allow access to
+	 * @param logContext Context string for logging (e.g., "prompted webhook", "parent resume")
+	 * @returns true if message was added to stream, false if session was resumed
+	 */
+	private async handlePromptWithStreamingCheck(
+		session: CyrusAgentSession,
+		repository: RepositoryConfig,
+		linearAgentActivitySessionId: string,
+		agentSessionManager: AgentSessionManager,
+		promptBody: string,
+		attachmentManifest: string,
+		isNewSession: boolean,
+		additionalAllowedDirs: string[],
+		logContext: string,
+		commentAuthor?: string,
+		commentTimestamp?: string,
+	): Promise<boolean> {
+		let selection = this.sessionRunnerSelections.get(
+			linearAgentActivitySessionId,
+		);
+		let fetchedIssueForSelection: LinearIssue | null = null;
+		let fetchedLabels: string[] | undefined;
+		const procedureMetadata =
+			(session.metadata?.procedure as ProcedureMetadata | undefined) ??
+			undefined;
+
+		if (!selection) {
+			fetchedIssueForSelection = await this.fetchFullIssueDetails(
+				session.issueId,
+				repository.id,
+			);
+			if (fetchedIssueForSelection) {
+				fetchedLabels = await this.fetchIssueLabels(fetchedIssueForSelection);
+				const resolvedSelection = this.resolveRunnerSelection({
+					labels: fetchedLabels,
+					repository,
+					procedureName: procedureMetadata?.procedureName,
+				});
+				selection = {
+					...resolvedSelection,
+					issueId: fetchedIssueForSelection.id,
+				};
+				this.sessionRunnerSelections.set(
+					linearAgentActivitySessionId,
+					selection,
+				);
+			}
+		}
+
+		if (selection?.type === "codex") {
+			console.log(
+				`[EdgeWorker] Handling codex session for ${linearAgentActivitySessionId} (${logContext})`,
+			);
+
+			await this.rerouteProcedureForSession(
+				session,
+				linearAgentActivitySessionId,
+				agentSessionManager,
+				promptBody,
+				repository,
+			);
+
+			if (!fetchedIssueForSelection) {
+				fetchedIssueForSelection = await this.fetchFullIssueDetails(
+					session.issueId,
+					repository.id,
+				);
+			}
+
+			const fullIssue = fetchedIssueForSelection;
+			if (!fullIssue) {
+				console.error(
+					`[EdgeWorker] Failed to fetch issue ${session.issueId} for codex session ${linearAgentActivitySessionId}`,
+				);
+				return false;
+			}
+
+			if (!fetchedLabels) {
+				fetchedLabels = await this.fetchIssueLabels(fullIssue);
+			}
+
+			let promptType: SystemPromptType | undefined = this.normalizePromptType(
+				selection.promptType,
+			);
+			if (!promptType) {
+				const systemPromptResult = await this.determineSystemPromptFromLabels(
+					fetchedLabels,
+					repository,
+				);
+				promptType = systemPromptResult?.type;
+			}
+
+			const allowedTools = this.buildAllowedTools(repository, promptType);
+			const disallowedTools = this.buildDisallowedTools(repository, promptType);
+			const { prompt: fullPrompt } = await this.buildPromptV2(
+				isNewSession,
+				session,
+				fullIssue,
+				repository,
+				promptBody,
+				attachmentManifest,
+				commentAuthor,
+				commentTimestamp,
+			);
+
+			const codexSelection: SessionRunnerMetadata = {
+				...selection,
+				promptType,
+				issueId: selection.issueId || fullIssue.id,
+			};
+			this.sessionRunnerSelections.set(
+				linearAgentActivitySessionId,
+				codexSelection,
+			);
+
+			await this.startNonClaudeRunner({
+				selection: codexSelection,
+				repository,
+				prompt: fullPrompt,
+				workspacePath: session.workspace.path,
+				linearAgentActivitySessionId,
+				issueId: fullIssue.id,
+				allowedTools,
+				disallowedTools,
+				promptType,
+				isFollowUp: !isNewSession,
+			});
+
+			return false;
+		}
+
+		// Check if runner is actively streaming before routing
+		const existingRunner = session.claudeRunner;
+		const isStreaming = existingRunner?.isStreaming() || false;
+
+		// Always route procedure for new input, UNLESS actively streaming
+		if (!isStreaming) {
+			await this.rerouteProcedureForSession(
+				session,
+				linearAgentActivitySessionId,
+				agentSessionManager,
+				promptBody,
+				repository,
+			);
+			console.log(`[EdgeWorker] Routed procedure for ${logContext}`);
+		} else {
+			console.log(
+				`[EdgeWorker] Skipping routing for ${linearAgentActivitySessionId} (${logContext}) - runner is actively streaming`,
+			);
+		}
+
+		// Handle streaming case - add message to existing stream
+		if (existingRunner?.isStreaming()) {
+			console.log(
+				`[EdgeWorker] Adding prompt to existing stream for ${linearAgentActivitySessionId} (${logContext})`,
+			);
+
+			// Append attachment manifest to the prompt if we have one
+			let fullPrompt = promptBody;
+			if (attachmentManifest) {
+				fullPrompt = `${promptBody}\n\n${attachmentManifest}`;
+			}
+
+			existingRunner.addStreamMessage(fullPrompt);
+			return true; // Message added to stream
+		}
+
+		// Not streaming - resume/start session
+		console.log(
+			`[EdgeWorker] Resuming Claude session for ${linearAgentActivitySessionId} (${logContext})`,
+		);
+
+		await this.resumeClaudeSession(
+			session,
+			repository,
+			linearAgentActivitySessionId,
+			agentSessionManager,
+			promptBody,
+			attachmentManifest,
+			isNewSession,
+			additionalAllowedDirs,
+			undefined, // maxTurns
+			commentAuthor,
+			commentTimestamp,
+		);
+
+		return false; // Session was resumed
 	}
 
 	/**
@@ -4844,6 +6351,9 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		attachmentManifest: string = "",
 		isNewSession: boolean = false,
 		additionalAllowedDirectories: string[] = [],
+		maxTurns?: number,
+		commentAuthor?: string,
+		commentTimestamp?: string,
 	): Promise<void> {
 		// Check for existing runner
 		const existingRunner = session.claudeRunner;
@@ -4910,6 +6420,10 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		];
 
 		// Create runner configuration
+		const resumeSessionId = needsNewClaudeSession
+			? undefined
+			: session.claudeSessionId;
+
 		const runnerConfig = this.buildClaudeRunnerConfig(
 			session,
 			repository,
@@ -4918,8 +6432,9 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 			allowedTools,
 			allowedDirectories,
 			disallowedTools,
-			needsNewClaudeSession ? undefined : session.claudeSessionId,
+			resumeSessionId,
 			labels, // Pass labels for model override
+			maxTurns, // Pass maxTurns if specified
 		);
 
 		const runner = new ClaudeRunner(runnerConfig);
@@ -4931,16 +6446,18 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		await this.savePersistedState();
 
 		// Prepare the full prompt
-		const fullPrompt = await this.buildSessionPrompt(
+		const { prompt: fullPrompt } = await this.buildPromptV2(
 			isNewSession,
+			session,
 			fullIssue,
 			repository,
 			promptBody,
 			attachmentManifest,
+			commentAuthor,
+			commentTimestamp,
 		);
 
 		// Start streaming session
-
 		try {
 			await runner.startStreaming(fullPrompt);
 		} catch (error) {
@@ -4960,14 +6477,6 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 		repositoryId: string,
 		isStreaming: boolean,
 	): Promise<void> {
-		const linearClient = this.linearClients.get(repositoryId);
-		if (!linearClient) {
-			console.warn(
-				`[EdgeWorker] No Linear client found for repository ${repositoryId}`,
-			);
-			return;
-		}
-
 		try {
 			const message = isStreaming
 				? "I've queued up your message as guidance"
@@ -4977,9 +6486,6 @@ ${newComment ? `New comment to address:\n${newComment.body}\n\n` : ""}Please ana
 				linearAgentActivitySessionId,
 				repositoryId,
 				message,
-			);
-			console.log(
-				`[EdgeWorker] Posted instant prompted acknowledgment response for session ${linearAgentActivitySessionId} (streaming: ${isStreaming})`,
 			);
 		} catch (error) {
 			console.error(

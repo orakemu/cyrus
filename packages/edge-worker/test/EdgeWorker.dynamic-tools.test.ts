@@ -309,6 +309,7 @@ describe("EdgeWorker - Dynamic Tools Configuration", () => {
 			const tools = buildAllowedTools(repository);
 			expect(tools).toEqual([
 				...getSafeTools(),
+				...SAFE_BASH_TOOL_ALLOWLIST,
 				"mcp__linear",
 				"mcp__cyrus-tools",
 			]);

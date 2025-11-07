@@ -153,6 +153,9 @@ describe("EdgeWorker Codex regression", () => {
 			proxyUrl: "http://localhost:3000",
 			cyrusHome: "/tmp/cyrus-home",
 			repositories: [repository],
+			features: {
+				postStatusActivities: true,
+			},
 			handlers: {
 				createWorkspace: vi.fn().mockResolvedValue({
 					path: workspacePath,
@@ -275,17 +278,21 @@ describe("EdgeWorker Codex regression", () => {
 			repository.id,
 			normalizedEvents[2].text,
 		);
-		expect(markSessionCompleteMock).toHaveBeenCalledWith(
-			sessionId,
-			repository.id,
-		);
+		if (config.features?.postStatusActivities) {
+			expect(markSessionCompleteMock).toHaveBeenCalledWith(
+				sessionId,
+				repository.id,
+			);
+		} else {
+			expect(markSessionCompleteMock).not.toHaveBeenCalled();
+		}
 
 		expect((edgeWorker as any).finalizedNonClaudeSessions.has(sessionId)).toBe(
 			true,
 		);
 		expect((edgeWorker as any).nonClaudeRunners.has(sessionId)).toBe(false);
 
-		expect(savePersistedStateSpy).toHaveBeenCalledTimes(3);
+		expect(savePersistedStateSpy).toHaveBeenCalledTimes(4);
 
 		const persistence = persistenceManagerInstances[0];
 		expect(persistence).toBeDefined();

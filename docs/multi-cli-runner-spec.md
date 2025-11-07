@@ -45,9 +45,59 @@ Initial implementation targets correctness and simple streaming (when available)
   - default CLI (e.g. `"claude"` or `"codex"`)
   - default model per CLI
   - per-CLI settings (e.g. Codex approval policy, sandbox)
+  - optional classifier runner/model selection and procedure defaults
 - Per-repo overrides in the existing `repositories[]` entries
 - Label-based routing can pick a CLI and optionally override model for that CLI
-- New CLI commands in `cyrus` for connecting OpenAI and setting defaults
+- New CLI commands in `cyrus` for connecting OpenAI, tuning the classifier, and assigning procedure defaults.
+
+### End-to-End CLI Walkthrough (Operator Checklist)
+
+1. **Connect OpenAI** (Codex only)
+   ```bash
+   cyrus connect-openai --non-interactive --api-key "$OPENAI_API_KEY"
+   ```
+   - Stores the API key in `credentials.openaiApiKey` and runs `codex login`. The CLI detects the installed codex-cli version, piping the key via `--with-api-key` when required and falling back to the legacy `--api-key` flag for older releases. If the CLI is missing, the command prompts the operator to install it.
+
+2. **Set global defaults**
+   ```bash
+   cyrus set-default-cli claude
+   cyrus set-default-model claude claude-3.7-sonnet
+   cyrus set-default-model codex o3-mini
+   ```
+   - Establishes the fallbacks used when repositories do not specify a runner.
+
+3. **Configure the classifier**
+   ```bash
+   cyrus set-classifier codex o3-mini
+   ```
+   - Redirects intelligent routing (procedure classification) through Codex when desired. Omit the model or pass `--clear-model` to revert to defaults.
+
+4. **Set procedure defaults**
+   ```bash
+   cyrus set-procedure-default full-development codex o3-mini
+   cyrus set-procedure-default orchestrator-full claude claude-3.7-sonnet
+   ```
+   - Pins specific procedures to preferred runners. Re-run with `--remove` to drop an override.
+
+5. **Add a repository** (interactive wizard)
+   ```bash
+   cyrus add-repository
+   ```
+   - The wizard now prompts for repository-level runner models; it scaffolds `runner`, `runnerModels`, and `procedureOverrides` as needed.
+
+6. **Validate configuration**
+   ```bash
+   cyrus validate
+   ```
+   - Runs the same availability checks performed at edge-worker startup (`codex --version`, `codex login status`, OpenAI key presence, Linear token health). Failures block production deployment.
+
+7. **Start the worker**
+   ```bash
+   cyrus start
+   ```
+   - The edge worker reuses the saved configuration, enforcing Codex prerequisites before connecting to Linear.
+
+Operators should re-run steps 3–4 when introducing new procedures or adjusting model mixes across repositories.
 
 ## Configuration Schema Changes
 
@@ -60,12 +110,16 @@ Top-level additions (EdgeConfig):
   - `claude?: { model?: string, fallbackModel?: string }`
   - `codex?: { model?: string, approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never", sandbox?: "read-only" | "workspace-write" | "danger-full-access" }`
 - `credentials?: { openaiApiKey?: string }`  // optional; env vars preferred
+- `classifier?: { runner?: "claude" | "codex", model?: string }`
+- `procedureDefaults?: Record<string, { runner?: "claude" | "codex", model?: string }>`
 
 RepositoryConfig additions (packages/edge-worker/src/types.ts):
 
 - `runner?: "claude" | "codex"`  // default CLI for this repository
 - `runnerModels?: { claude?: { model?: string, fallbackModel?: string }, codex?: { model?: string } }`
 - `labelAgentRouting?: Array<{ labels: string[], runner: "claude" | "codex", model?: string }>`
+- `classifierOverride?: { runner?: "claude" | "codex", model?: string }`
+- `procedureOverrides?: Record<string, { runner?: "claude" | "codex", model?: string }>`
 
 Notes:
 
@@ -77,9 +131,14 @@ Notes:
 ```json
 {
   "defaultCli": "claude",
+  "classifier": { "runner": "claude", "model": "claude-3.7-haiku" },
   "cliDefaults": {
     "claude": { "model": "claude-3.7-sonnet", "fallbackModel": "claude-3.5-sonnet" },
     "codex": { "model": "o3", "approvalPolicy": "never", "sandbox": "workspace-write" }
+  },
+  "procedureDefaults": {
+    "full-development": { "runner": "codex", "model": "o3-mini" },
+    "orchestrator-full": { "runner": "claude", "model": "claude-3.7-sonnet" }
   },
   "credentials": { "openaiApiKey": "env:OPENAI_API_KEY" },
   "repositories": [
@@ -94,6 +153,10 @@ Notes:
       "runner": "codex",
       "runnerModels": {
         "codex": { "model": "o3-mini" }
+      },
+      "classifierOverride": { "runner": "codex", "model": "o3-mini" },
+      "procedureOverrides": {
+        "debugger-full": { "runner": "claude", "model": "claude-3.7-sonnet" }
       },
       "labelAgentRouting": [
         { "labels": ["PRD"], "runner": "claude", "model": "claude-3.7-sonnet" },
@@ -151,10 +214,24 @@ Add a resolver that selects the runner and model for a given issue:
 Order of precedence (first match wins):
 
 1. `repository.labelAgentRouting` labels
-2. Repo-level `runner`/`runnerModels`
-3. Global `defaultCli`/`cliDefaults`
+2. Repository `procedureOverrides` (procedure name or classification key)
+3. Global `procedureDefaults`
+4. Repo-level `runner` / `runnerModels`
+5. Global `defaultCli` / `cliDefaults`
 
-If multiple label routing rules match, take the earliest match in `labelAgentRouting`.
+If multiple label routing rules match, take the earliest match in `labelAgentRouting`. The resolver runs on new sessions and whenever no runner is active, so overrides take effect on follow-up comments too.
+
+Global/repo classifier overrides affect which runner performs classification, but the chosen procedure ultimately flows through the same precedence list.
+
+### Validation & Safety Checks
+
+Whenever any configuration path resolves to Codex (global defaults, classifier, procedure overrides, repository overrides, or label routing), the edge worker validates the environment during startup:
+
+1. Ensure an OpenAI API key is available (environment variable, `credentials.openaiApiKey`, or repository `openaiApiKey`).
+2. Ensure the Codex CLI is installed by running `codex --version`.
+3. Confirm authentication status via `codex login status`.
+
+If any check fails, startup aborts with an actionable error. The CLI `cyrus validate` command surfaces the same checks for operators.
 
 ## Integration Details by CLI
 
@@ -178,8 +255,8 @@ References:
 - CLI: https://github.com/openai/codex
 - Non-interactive mode: `codex exec --json "..."` (docs/getting-started.md, docs/advanced.md)
 - Flags: `--model/-m`, `--cd`, `--approval-policy`, `--sandbox`, `--full-auto`
-- Auth: `codex login` (OAuth) or `codex login --api-key $OPENAI_API_KEY` / `cyrus connect-openai` for headless deployments
-- Validation: `cyrus validate` runs a Codex health check to confirm the CLI is installed and authenticated
+- Auth: `codex login` (OAuth) or piping an API key via `printenv OPENAI_API_KEY | codex login --with-api-key`. `cyrus connect-openai` should detect CLI ≥0.55 and choose the stdin flow automatically.
+- Validation: `cyrus validate` runs a Codex health check to confirm the CLI is installed and authenticated, relying on `codex login status` for compatibility across codex-cli releases.
 
 Invocation (baseline):
 
@@ -187,6 +264,7 @@ Invocation (baseline):
 - Environment: `OPENAI_API_KEY` set if using API key auth
 - Output handling: capture stdout/stderr, stream lines as `RunnerEvent { kind: "text" }`, emit `result` on process exit
 - Optional resume: future enhancement via `codex exec resume --last` to continue prior context
+- 2025-11-06 note: `cyrus validate` now uses `codex login status`; future follow-up can revisit whether a lightweight `codex exec` probe is still required once we settle on a production-safe invocation format.
 
 Sandbox/Approvals mapping from Cyrus tool presets:
 
@@ -245,6 +323,8 @@ Add subcommands to `apps/cli/app.ts`:
 - `cyrus connect-openai` — prompts for `OPENAI_API_KEY`, stores in `~/.cyrus/config.json` under `credentials.openaiApiKey` (or uses env vars), applies to Codex (`codex login --api-key`)
 - `cyrus set-default-cli <claude|codex>` — updates `defaultCli`
 - `cyrus set-default-model <cli> <model>` — updates `cliDefaults[cli].model`
+- `cyrus set-classifier <claude|codex> [model]` — updates `classifier`
+- `cyrus set-procedure-default <procedure> <claude|codex> [model]` (with `--remove`) — updates `procedureDefaults`
 
 Wizard updates:
 

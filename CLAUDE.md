@@ -47,6 +47,49 @@ cyrus/
 
 For a detailed visual representation of how these components interact and map Claude Code sessions to Linear comment threads, see @architecture.md.
 
+## Testing Best Practices
+
+### Prompt Assembly Tests
+
+When working with prompt assembly tests in `packages/edge-worker/test/prompt-assembly*.test.ts`:
+
+**CRITICAL: Always assert the ENTIRE prompt, never use partial checks like `.toContain()`**
+
+- Use `.expectUserPrompt()` with the complete expected prompt string
+- Use `.expectSystemPrompt()` with the complete expected system prompt (or `undefined`)
+- Use `.expectComponents()` to verify all prompt components
+- Use `.expectPromptType()` to verify the prompt type
+- Always call `.verify()` to execute all assertions
+
+This ensures comprehensive test coverage and catches regressions in prompt structure, formatting, and content. Partial assertions with `.toContain()` are too weak and can miss important changes.
+
+**Example**:
+```typescript
+// ✅ CORRECT - Full prompt assertion
+await scenario(worker)
+  .newSession()
+  .withUserComment("Test comment")
+  .expectUserPrompt(`<user_comment>
+  <author>Test User</author>
+  <timestamp>2025-01-27T12:00:00Z</timestamp>
+  <content>
+Test comment
+  </content>
+</user_comment>`)
+  .expectSystemPrompt(undefined)
+  .expectPromptType("continuation")
+  .expectComponents("user-comment")
+  .verify();
+
+// ❌ INCORRECT - Partial assertion (too weak)
+const result = await scenario(worker)
+  .newSession()
+  .withUserComment("Test comment")
+  .build();
+expect(result.userPrompt).toContain("<user_comment>");
+expect(result.userPrompt).toContain("Test User");
+```
+
 ## Common Commands
 
 ### Monorepo-wide Commands (run from root)
@@ -156,6 +199,8 @@ The agent automatically moves issues to the "started" state when assigned. Linea
 
 4. **Testing**: Uses Vitest for all packages. Run tests before committing changes.
 
+5. **Multi-CLI configuration knobs**: `~/.cyrus/config.json` now supports global `classifier` and `procedureDefaults` entries, plus per-repository `classifierOverride` / `procedureOverrides`. Use these to pin specific procedures (e.g., orchestrator) or the classifier itself to Codex or Claude models. When any configuration path resolves to Codex, the edge worker validates that the Codex CLI is installed and an OpenAI API key is available at startup. `cyrus connect-openai` now pipes API keys to `codex login --with-api-key` automatically (falling back to the legacy flag when necessary), and `cyrus validate` checks `codex login status` so the health probe works across codex-cli versions.
+
 ## Development Workflow
 
 When working on this codebase, follow these practices:
@@ -207,7 +252,7 @@ To test the Linear MCP (Model Context Protocol) integration in the claude-runner
 
 The test script demonstrates:
 - Loading Linear API token from environment variables
-- Configuring the `@tacticlaunch/mcp-linear` MCP server
+- Configuring the official Linear HTTP MCP server
 - Listing available MCP tools
 - Using Linear MCP tools to fetch user info and issues
 - Proper error handling and logging
@@ -218,7 +263,7 @@ The script will show:
 - Current user information
 - Issues in your Linear workspace
 
-This integration is automatically available in all Cyrus sessions - the EdgeWorker automatically configures the Linear MCP server for each repository using its Linear token.
+This integration is automatically available in all Cyrus sessions - the EdgeWorker automatically configures the official Linear MCP server for each repository using its Linear token.
 
 ## Publishing
 
@@ -245,24 +290,59 @@ This integration is automatically available in all Cyrus sessions - the EdgeWork
    pnpm install  # Ensures all workspace dependencies are up to date
    ```
 
-2. **Build and publish underlying packages first** (if they've changed):
+2. **Build all packages from root first**:
    ```bash
-   cd packages/core && pnpm install && pnpm build && pnpm publish --access public
-   cd ../claude-runner && pnpm install && pnpm build && pnpm publish --access public  
-   cd ../edge-worker && pnpm install && pnpm build && pnpm publish --access public
-   cd ../ndjson-client && pnpm install && pnpm build && pnpm publish --access public
+   pnpm build  # Builds all packages to ensure dependencies are resolved
    ```
 
-3. **Install again from root to update lockfile**:
+3. **Publish packages in dependency order**:
+
+   **IMPORTANT**: Publish in this exact order to avoid dependency resolution issues:
+
    ```bash
-   cd ../.. # Back to root
-   pnpm install  # Updates lockfile with published package versions
+   # 1. Packages with no internal dependencies
+   cd packages/ndjson-client && pnpm publish --access public --no-git-checks
+   cd ../..
+   pnpm install  # Update lockfile
+
+   # 2. Packages that depend on external deps only
+   cd packages/claude-runner && pnpm publish --access public --no-git-checks
+   cd ../..
+   pnpm install  # Update lockfile
+
+   # 3. Core package (depends on claude-runner)
+   cd packages/core && pnpm publish --access public --no-git-checks
+   cd ../..
+   pnpm install  # Update lockfile
+
+   # 4. Simple agent runner (depends on claude-runner)
+   cd packages/simple-agent-runner && pnpm publish --access public --no-git-checks
+   cd ../..
+   pnpm install  # Update lockfile
+
+   # 5. Edge worker (depends on core, claude-runner, ndjson-client, simple-agent-runner)
+   cd packages/edge-worker && pnpm publish --access public --no-git-checks
+   cd ../..
+   pnpm install  # Update lockfile
    ```
 
 4. **Finally publish the CLI**:
    ```bash
-   cd apps/cli && pnpm install && pnpm build && pnpm publish --access public
+   pnpm install  # Final install to ensure all deps are latest
+   cd apps/cli && pnpm publish --access public --no-git-checks
+   cd ../..
    ```
 
-This ensures that when pnpm resolves `workspace:*` references during CLI publishing, it uses the latest published package versions rather than outdated ones.
+5. **Create git tag and push**:
+   ```bash
+   git tag v0.1.XX
+   git push origin <branch-name>
+   git push origin v0.1.XX
+   ```
 
+**Key Notes:**
+- Always use `--no-git-checks` flag to publish from feature branches
+- Run `pnpm install` after each publish to update the lockfile
+- The `simple-agent-runner` package MUST be published before `edge-worker`
+- Build all packages once at the start, then publish without rebuilding
+- This ensures `workspace:*` references resolve to published versions

@@ -12,15 +12,17 @@ import http from "node:http";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 import type { Issue } from "@linear/sdk";
-import { DEFAULT_PROXY_URL } from "cyrus-core";
 import {
-	type CliDefaults,
-	type EdgeCredentials,
-	EdgeWorker,
+	DEFAULT_PROXY_URL,
+	type EdgeConfig,
 	type EdgeWorkerConfig,
 	type RepositoryConfig,
 	type RunnerType,
+} from "cyrus-core";
+import {
+	EdgeWorker,
 	SAFE_BASH_TOOL_ALLOWLIST,
 	SharedApplicationServer,
 } from "cyrus-edge-worker";
@@ -39,7 +41,6 @@ import {
 	type LabelConflict,
 	type PromptAwareConfig,
 	type PromptPlan,
-	type PromptRuleConfigShape,
 } from "./prompt-mutators.js";
 import { ensurePromptsDirectory } from "./prompt-paths.js";
 
@@ -64,11 +65,17 @@ if (cyrusHomeArg) {
 	CYRUS_HOME = resolve(homedir(), ".cyrus");
 }
 
-// Note: __dirname removed since version is now hardcoded
+// Get the directory of the current module for reading package.json
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Read package.json to get the actual version
+const packageJsonPath = resolve(__dirname, "..", "package.json");
+const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8"));
 
 // Handle --version argument
 if (args.includes("--version")) {
-	console.log("0.1.37");
+	console.log(packageJson.version);
 	process.exit(0);
 }
 
@@ -89,6 +96,8 @@ Commands:
   connect-openai     Store OpenAI credentials and sync Codex
   set-default-cli    Set the global default CLI runner
   set-default-model  Configure default models for a CLI provider
+  set-classifier     Configure the intelligent classifier runner/model
+  set-procedure-default  Configure default runner/model for a procedure
   migrate-config     Backup and upgrade config for multi-CLI support
   validate           Run connectivity and dependency checks
   prompts list       List current prompt-label mappings
@@ -111,6 +120,8 @@ Examples:
   cyrus connect-openai --non-interactive --api-key $OPENAI_API_KEY
   cyrus set-default-cli codex
   cyrus set-default-model codex gpt-4o-mini
+  cyrus set-classifier codex gpt-4o-mini
+  cyrus set-procedure-default orchestrator-full codex gpt-4o-mini
   cyrus migrate-config --backup-dir ~/.cyrus/backups
   cyrus validate
   cyrus --cyrus-home=/tmp/cyrus  Use custom config directory
@@ -132,18 +143,6 @@ interface LinearCredentials {
 	linearWorkspaceName: string;
 }
 
-interface EdgeConfig {
-	repositories: RepositoryConfig[];
-	ngrokAuthToken?: string;
-	stripeCustomerId?: string;
-	defaultModel?: string; // Default Claude model to use across all repositories
-	defaultFallbackModel?: string; // Default fallback model if primary model is unavailable
-	defaultCli?: RunnerType; // Default runner to use when repository doesn't override
-	cliDefaults?: CliDefaults; // Default per-runner configuration options
-	credentials?: EdgeCredentials; // Stored credential references (e.g., OpenAI API key)
-	promptDefaults?: Record<string, PromptRuleConfigShape | undefined>;
-}
-
 interface Workspace {
 	path: string;
 	isGitWorktree: boolean;
@@ -157,6 +156,14 @@ function ensureCliDefaultsStructure(config: EdgeConfig): void {
 
 function ensureCredentialsStructure(config: EdgeConfig): void {
 	config.credentials = config.credentials || {};
+}
+
+function ensureClassifierStructure(config: EdgeConfig): void {
+	config.classifier = config.classifier || { runner: "claude", model: "haiku" };
+}
+
+function ensureProcedureDefaultsStructure(config: EdgeConfig): void {
+	config.procedureDefaults = config.procedureDefaults || {};
 }
 
 function applyDefaultCli(
@@ -201,6 +208,11 @@ function ensureRepositoryScaffold(repo: RepositoryConfig): void {
 	repo.runnerModels.claude = repo.runnerModels.claude || {};
 	repo.runnerModels.codex = repo.runnerModels.codex || {};
 	repo.labelAgentRouting = repo.labelAgentRouting || [];
+	repo.procedureOverrides = repo.procedureOverrides || {};
+	repo.classifierOverride =
+		repo.classifierOverride && Object.keys(repo.classifierOverride).length > 0
+			? repo.classifierOverride
+			: undefined;
 }
 
 function copyLegacyModelDefaultsToCli(config: EdgeConfig): void {
@@ -457,13 +469,6 @@ function handlePromptCommandError(
 	process.exit(1);
 }
 
-function formatPromptLabels(labels: string[]): string {
-	if (!labels || labels.length === 0) {
-		return "(none)";
-	}
-	return labels.join(", ");
-}
-
 function printIndentedContent(content: string, indent = "    "): void {
 	const trimmed = content.trimEnd();
 	const lines = trimmed.split(/\r?\n/);
@@ -640,64 +645,43 @@ async function promptsListCommand(subArgs: string[]): Promise<void> {
 		repoId,
 		promptDefaults: config.promptDefaults,
 	});
-	const definitionsById = new Map(
-		inventory.definitions.map((definition) => [definition.id, definition]),
+
+	const globalDefinitions = inventory.definitions.filter(
+		(definition) =>
+			definition.scope === "global" && definition.source === "custom",
+	);
+	const promptDefaultDefinitions = inventory.definitions.filter(
+		(definition) =>
+			definition.scope === "global" && definition.source === "built-in",
+	);
+	const repositoryDefinitions = inventory.definitions.filter(
+		(definition) => definition.scope === "repository",
 	);
 
 	if (jsonOutput) {
-		console.log(
-			JSON.stringify(
-				{
-					promptDefinitions: inventory.definitions,
-					repositories: inventory.repositories,
-				},
-				null,
-				2,
-			),
-		);
+		console.log(JSON.stringify(inventory, null, 2));
 		return;
 	}
 
-	if (inventory.repositories.length === 0) {
-		if (repositories.length === 0) {
-			console.log(
-				'No repositories configured. Add one with "cyrus add-repository" before managing prompts.',
-			);
-			return;
-		}
-		console.log("No prompt mappings found.");
-		return;
-	}
+	console.log("\nPrompt Definitions");
+	console.log("─".repeat(50));
 
-	console.log("\nPrompt mappings:\n");
-
-	const globalDefinitions = inventory.definitions.filter(
-		(definition) => definition.scope === "global",
+	printDefinitionSection("Global Prompt Mappings", globalDefinitions);
+	printDefinitionSection(
+		"Repository-Specific Prompt Mappings",
+		repositoryDefinitions,
 	);
-	printDefinitionSection("Global prompts", globalDefinitions);
+	printDefinitionSection(
+		"Prompt Defaults (Fallbacks)",
+		promptDefaultDefinitions,
+	);
 
-	for (const summary of inventory.repositories) {
-		const repoLabel = summary.repositoryName
-			? `${summary.repositoryName} (${summary.repositoryId})`
-			: summary.repositoryId;
-		console.log(`Repository: ${repoLabel}`);
-		for (const prompt of summary.prompts) {
-			const labelList = formatPromptLabels(prompt.labels);
-			const definition = definitionsById.get(prompt.definitionId);
-			const scopeSuffix = definition?.scope === "global" ? " (shared)" : "";
-			console.log(
-				`  ${prompt.prompt} [${prompt.source}] labels: ${labelList}${scopeSuffix}`,
-			);
-			if (definition && definition.scope !== "global") {
-				if (definition.content) {
-					console.log("    Content:");
-					printIndentedContent(definition.content, "      ");
-				} else {
-					console.log("    Content: (not available)");
-				}
-			}
-		}
-		console.log("");
+	if (
+		globalDefinitions.length === 0 &&
+		repositoryDefinitions.length === 0 &&
+		promptDefaultDefinitions.length === 0
+	) {
+		console.log("No prompt definitions found.");
 	}
 }
 
@@ -721,21 +705,14 @@ async function promptsCreateCommand(subArgs: string[]): Promise<void> {
 	}
 
 	const labelsValue = getFlagValue(flagArgs, "labels");
-	if (!labelsValue) {
-		console.error(
-			"Missing required --labels option. Provide a comma-separated list of labels.",
-		);
-		process.exit(1);
-	}
-
-	const labels = splitCommaSeparated(labelsValue);
+	const labels = splitCommaSeparated(labelsValue ?? "");
 	if (labels.length === 0) {
-		console.error("At least one label must be provided.");
+		console.error("--labels is required and must contain at least one label.");
 		process.exit(1);
 	}
 
 	const repoId = getFlagValue(flagArgs, "repo");
-	const fromFilePath = getFlagValue(flagArgs, "from-file");
+	const fromFile = getFlagValue(flagArgs, "from-file");
 	const dryRun = hasFlag(flagArgs, "dry-run");
 	const jsonOutput = hasFlag(flagArgs, "json");
 	const yes = hasFlag(flagArgs, "yes");
@@ -760,7 +737,7 @@ async function promptsCreateCommand(subArgs: string[]): Promise<void> {
 			name: nameArg,
 			labels,
 			repoId,
-			fromFilePath,
+			fromFilePath: fromFile,
 		});
 	} catch (error) {
 		handlePromptCommandError(error, { jsonOutput });
@@ -961,15 +938,40 @@ async function promptsCommand(): Promise<void> {
 }
 
 function configRequiresCodex(config: EdgeConfig): boolean {
-	if (config.defaultCli === "codex") {
+	const isCodex = (value: unknown): boolean =>
+		typeof value === "string" && value.toLowerCase() === "codex";
+
+	if (isCodex(config.defaultCli)) {
+		return true;
+	}
+	if (isCodex(config.classifier?.runner)) {
+		return true;
+	}
+	if (
+		config.procedureDefaults &&
+		Object.values(config.procedureDefaults).some(
+			(overrides) => overrides && isCodex(overrides.runner),
+		)
+	) {
 		return true;
 	}
 	return config.repositories.some((repo) => {
-		if (repo.runner === "codex") {
+		if (isCodex(repo.runner)) {
+			return true;
+		}
+		if (isCodex(repo.classifierOverride?.runner)) {
+			return true;
+		}
+		if (
+			repo.procedureOverrides &&
+			Object.values(repo.procedureOverrides).some(
+				(override) => override && isCodex(override.runner),
+			)
+		) {
 			return true;
 		}
 		return (
-			repo.labelAgentRouting?.some((rule) => rule.runner === "codex") ?? false
+			repo.labelAgentRouting?.some((rule) => isCodex(rule.runner)) ?? false
 		);
 	});
 }
@@ -1011,9 +1013,6 @@ async function promptHiddenInput(prompt: string): Promise<string> {
 	});
 }
 
-/**
- * Edge application that uses EdgeWorker from package
- */
 class EdgeApp {
 	private edgeWorker: EdgeWorker | null = null;
 	private isShuttingDown = false;
@@ -1131,86 +1130,6 @@ class EdgeApp {
 		writeFileSync(edgeConfigPath, JSON.stringify(config, null, 2));
 	}
 
-	private ensureCliDefaultsBucket(
-		config: EdgeConfig,
-		runner: RunnerType,
-	): void {
-		config.cliDefaults = config.cliDefaults || {};
-		if (runner === "claude") {
-			config.cliDefaults.claude = config.cliDefaults.claude || {};
-		} else if (runner === "codex") {
-			config.cliDefaults.codex = config.cliDefaults.codex || {};
-		}
-	}
-
-	private async promptForDefaultCli(): Promise<RunnerType> {
-		console.log("\n⚙️  Default CLI Configuration");
-		console.log("─".repeat(50));
-		console.log(
-			"Select which CLI Cyrus should use by default when routing issues.",
-		);
-		console.log("1. Claude (Anthropic Claude Code)");
-		console.log("2. Codex (OpenAI Codex CLI)");
-
-		const choice = await this.askQuestion(
-			"\nChoose default CLI [1-2] (default: 1): ",
-		);
-
-		if (choice === "2") {
-			return "codex";
-		}
-		return "claude";
-	}
-
-	private copyLegacyModelDefaults(config: EdgeConfig): void {
-		if (!config.cliDefaults?.claude) {
-			return;
-		}
-		if (config.defaultModel && config.cliDefaults.claude.model === undefined) {
-			config.cliDefaults.claude.model = config.defaultModel;
-		}
-		if (
-			config.defaultFallbackModel &&
-			config.cliDefaults.claude.fallbackModel === undefined
-		) {
-			config.cliDefaults.claude.fallbackModel = config.defaultFallbackModel;
-		}
-	}
-
-	private async ensureDefaultCliConfigured(config: EdgeConfig): Promise<void> {
-		if (config.defaultCli) {
-			this.ensureCliDefaultsBucket(config, config.defaultCli);
-			if (config.defaultCli === "claude") {
-				this.copyLegacyModelDefaults(config);
-			}
-			return;
-		}
-
-		const hasRepositories = (config.repositories?.length || 0) > 0;
-
-		if (hasRepositories) {
-			config.defaultCli = "claude";
-			this.ensureCliDefaultsBucket(config, "claude");
-			this.copyLegacyModelDefaults(config);
-			this.saveEdgeConfig(config);
-			console.log(
-				"\nℹ️  Default CLI set to Claude for compatibility with existing configuration.",
-			);
-			return;
-		}
-
-		const selectedDefault = await this.promptForDefaultCli();
-		config.defaultCli = selectedDefault;
-		this.ensureCliDefaultsBucket(config, selectedDefault);
-		if (selectedDefault === "claude") {
-			this.copyLegacyModelDefaults(config);
-		}
-		this.saveEdgeConfig(config);
-		console.log(
-			`\n✅ Saved ${selectedDefault} as the global default CLI. You can change this later with "cyrus set-default-cli".`,
-		);
-	}
-
 	/**
 	 * Interactive setup wizard for repository configuration
 	 */
@@ -1258,7 +1177,7 @@ class EdgeApp {
 			// Note: Prompt template is now hardcoded - no longer configurable
 
 			// Set reasonable defaults for configuration
-			// Allowed tools - default to the safe preset (read/write tools plus vetted git/gh commands)
+			// Allowed tools - default to the safe preset (read/write tools plus vetted bash commands)
 			// Note: MCP tools (mcp__linear, mcp__cyrus-mcp-tools) are automatically added by EdgeWorker
 			const allowedTools = [
 				"Read(**)",
@@ -1464,13 +1383,13 @@ class EdgeApp {
 		proxyUrl: string;
 		repositories: RepositoryConfig[];
 	}): Promise<void> {
-		const storedConfig = this.loadEdgeConfig();
 		// Get ngrok auth token (prompt if needed and not external host)
 		let ngrokAuthToken: string | undefined;
 		const isExternalHost =
 			process.env.CYRUS_HOST_EXTERNAL?.toLowerCase().trim() === "true";
 		if (!isExternalHost) {
-			ngrokAuthToken = await this.getNgrokAuthToken(storedConfig);
+			const config = this.loadEdgeConfig();
+			ngrokAuthToken = await this.getNgrokAuthToken(config);
 		}
 
 		// Create EdgeWorker configuration
@@ -1485,13 +1404,10 @@ class EdgeApp {
 				undefined,
 			// Model configuration: environment variables take precedence over config file
 			defaultModel:
-				process.env.CYRUS_DEFAULT_MODEL || storedConfig.defaultModel,
+				process.env.CYRUS_DEFAULT_MODEL || this.loadEdgeConfig().defaultModel,
 			defaultFallbackModel:
 				process.env.CYRUS_DEFAULT_FALLBACK_MODEL ||
-				storedConfig.defaultFallbackModel,
-			defaultCli: storedConfig.defaultCli,
-			cliDefaults: storedConfig.cliDefaults,
-			credentials: storedConfig.credentials,
+				this.loadEdgeConfig().defaultFallbackModel,
 			webhookBaseUrl: process.env.CYRUS_BASE_URL,
 			serverPort: process.env.CYRUS_SERVER_PORT
 				? parseInt(process.env.CYRUS_SERVER_PORT, 10)
@@ -1590,6 +1506,10 @@ class EdgeApp {
 		// Create and start EdgeWorker
 		this.edgeWorker = new EdgeWorker(config);
 
+		// Set config path for dynamic reloading
+		const configPath = this.getEdgeConfigPath();
+		this.edgeWorker.setConfigPath(configPath);
+
 		// Set up event handlers
 		this.setupEventHandlers();
 
@@ -1598,17 +1518,9 @@ class EdgeApp {
 
 		console.log("\n✅ Edge worker started successfully");
 		console.log(`Configured proxy URL: ${config.proxyUrl}`);
-		const defaultCli = config.defaultCli ?? "claude";
-		console.log(`Runner defaults: ${defaultCli}`);
 		console.log(`Managing ${repositories.length} repositories:`);
 		repositories.forEach((repo) => {
-			const runner = repo.runner ?? defaultCli;
-			const labelRoutes = repo.labelAgentRouting?.length ?? 0;
-			const routingNote =
-				labelRoutes > 0 ? `, label routes: ${labelRoutes}` : "";
-			console.log(
-				`  - ${repo.name} (${repo.repositoryPath}) → runner: ${runner}${routingNote}`,
-			);
+			console.log(`  - ${repo.name} (${repo.repositoryPath})`);
 		});
 	}
 
@@ -1743,7 +1655,6 @@ class EdgeApp {
 
 			// Load edge configuration
 			let edgeConfig = this.loadEdgeConfig();
-			await this.ensureDefaultCliConfigured(edgeConfig);
 			let repositories = edgeConfig.repositories || [];
 
 			// Check if using default proxy URL without a customer ID
@@ -1884,7 +1795,7 @@ class EdgeApp {
 							"\nSelect workspace (number) or press Enter for new: ",
 						);
 
-						const index = parseInt(choice) - 1;
+						const index = parseInt(choice, 10) - 1;
 						if (index >= 0 && index < workspaceList.length) {
 							const ws = workspaceList[index];
 							if (ws) {
@@ -2174,6 +2085,106 @@ class EdgeApp {
 	}
 
 	/**
+	 * Run a setup script with proper error handling and logging
+	 */
+	private async runSetupScript(
+		scriptPath: string,
+		scriptType: "global" | "repository",
+		workspacePath: string,
+		issue: Issue,
+	): Promise<void> {
+		const { execSync } = await import("node:child_process");
+		const { existsSync, statSync } = await import("node:fs");
+		const { basename } = await import("node:path");
+		const os = await import("node:os");
+
+		// Expand ~ to home directory
+		const expandedPath = scriptPath.replace(/^~/, os.homedir());
+
+		// Check if script exists
+		if (!existsSync(expandedPath)) {
+			console.warn(
+				`⚠️  ${scriptType === "global" ? "Global" : "Repository"} setup script not found: ${scriptPath}`,
+			);
+			return;
+		}
+
+		// Check if script is executable (Unix only)
+		if (process.platform !== "win32") {
+			try {
+				const stats = statSync(expandedPath);
+				// Check if file has execute permission for the owner
+				if (!(stats.mode & 0o100)) {
+					console.warn(
+						`⚠️  ${scriptType === "global" ? "Global" : "Repository"} setup script is not executable: ${scriptPath}`,
+					);
+					console.warn(`   Run: chmod +x "${expandedPath}"`);
+					return;
+				}
+			} catch (error) {
+				console.warn(
+					`⚠️  Cannot check permissions for ${scriptType} setup script: ${(error as Error).message}`,
+				);
+				return;
+			}
+		}
+
+		const scriptName = basename(expandedPath);
+		console.log(`ℹ️  Running ${scriptType} setup script: ${scriptName}`);
+
+		try {
+			// Determine the command based on the script extension and platform
+			let command: string;
+			const isWindows = process.platform === "win32";
+
+			if (scriptPath.endsWith(".ps1")) {
+				command = `powershell -ExecutionPolicy Bypass -File "${expandedPath}"`;
+			} else if (scriptPath.endsWith(".cmd") || scriptPath.endsWith(".bat")) {
+				command = `"${expandedPath}"`;
+			} else if (isWindows) {
+				// On Windows, try to run with bash if available (Git Bash/WSL)
+				command = `bash "${expandedPath}"`;
+			} else {
+				// On Unix, run directly with bash
+				command = `bash "${expandedPath}"`;
+			}
+
+			execSync(command, {
+				cwd: workspacePath,
+				stdio: "inherit",
+				env: {
+					...process.env,
+					LINEAR_ISSUE_ID: issue.id,
+					LINEAR_ISSUE_IDENTIFIER: issue.identifier,
+					LINEAR_ISSUE_TITLE: issue.title || "",
+				},
+				timeout: 5 * 60 * 1000, // 5 minute timeout
+			});
+
+			console.log(
+				`✅ ${scriptType === "global" ? "Global" : "Repository"} setup script completed successfully`,
+			);
+		} catch (error) {
+			const errorMessage =
+				(error as any).signal === "SIGTERM"
+					? "Script execution timed out (exceeded 5 minutes)"
+					: (error as Error).message;
+
+			console.error(
+				`❌ ${scriptType === "global" ? "Global" : "Repository"} setup script failed: ${errorMessage}`,
+			);
+
+			// Log stderr if available
+			if ((error as any).stderr) {
+				console.error("   stderr:", (error as any).stderr.toString());
+			}
+
+			// Continue execution despite setup script failure
+			console.log(`   Continuing with worktree creation...`);
+		}
+	}
+
+	/**
 	 * Create a git worktree for an issue
 	 */
 	async createGitWorktree(
@@ -2382,27 +2393,34 @@ class EdgeApp {
 				stdio: "pipe",
 			});
 
-			// Check for setup scripts in the repository root (cross-platform)
+			// First, run the global setup script if configured
+			const config = this.loadEdgeConfig();
+			if (config.global_setup_script) {
+				await this.runSetupScript(
+					config.global_setup_script,
+					"global",
+					workspacePath,
+					issue,
+				);
+			}
+
+			// Then, check for repository setup scripts (cross-platform)
 			const isWindows = process.platform === "win32";
 			const setupScripts = [
 				{
 					file: "cyrus-setup.sh",
-					command: "bash cyrus-setup.sh",
 					platform: "unix",
 				},
 				{
 					file: "cyrus-setup.ps1",
-					command: "powershell -ExecutionPolicy Bypass -File cyrus-setup.ps1",
 					platform: "windows",
 				},
 				{
 					file: "cyrus-setup.cmd",
-					command: "cyrus-setup.cmd",
 					platform: "windows",
 				},
 				{
 					file: "cyrus-setup.bat",
-					command: "cyrus-setup.bat",
 					platform: "windows",
 				},
 			];
@@ -2428,25 +2446,13 @@ class EdgeApp {
 			const scriptToRun = availableScript || fallbackScript;
 
 			if (scriptToRun) {
-				console.log(`Running ${scriptToRun.file} in new worktree...`);
-				try {
-					execSync(scriptToRun.command, {
-						cwd: workspacePath,
-						stdio: "inherit",
-						env: {
-							...process.env,
-							LINEAR_ISSUE_ID: issue.id,
-							LINEAR_ISSUE_IDENTIFIER: issue.identifier,
-							LINEAR_ISSUE_TITLE: issue.title || "",
-						},
-					});
-				} catch (error) {
-					console.warn(
-						`Warning: ${scriptToRun.file} failed:`,
-						(error as Error).message,
-					);
-					// Continue despite setup script failure
-				}
+				const scriptPath = join(repository.repositoryPath, scriptToRun.file);
+				await this.runSetupScript(
+					scriptPath,
+					"repository",
+					workspacePath,
+					issue,
+				);
 			}
 
 			return {
@@ -2579,7 +2585,7 @@ async function refreshTokenCommand() {
 			...Array.from({ length: tokenStatuses.length }, (_, i) => i),
 		);
 	} else {
-		const index = parseInt(answer) - 1;
+		const index = parseInt(answer, 10) - 1;
 		if (Number.isNaN(index) || index < 0 || index >= tokenStatuses.length) {
 			console.error("Invalid selection");
 			process.exit(1);
@@ -2930,33 +2936,162 @@ async function connectOpenAiCommand() {
 	console.log("Run 'cyrus validate' to confirm Codex connectivity when ready.");
 }
 
-function runCodexLogin(apiKey: string): Promise<void> {
+async function runCodexLogin(apiKey: string): Promise<void> {
+	const pipeAttempt = await attemptCodexLoginWithPipe(apiKey);
+	if (pipeAttempt.result === "success") {
+		console.log("\n✅ Codex CLI login succeeded.");
+		return;
+	}
+
+	if (pipeAttempt.result === "not-found") {
+		console.log("\nℹ️  Codex CLI not found on PATH. Skipping codex login step.");
+		return;
+	}
+
+	if (pipeAttempt.result === "unsupported") {
+		console.log(
+			"\nℹ️  Codex CLI version does not support '--with-api-key'; retrying with legacy flag.",
+		);
+		const legacyAttempt = await attemptCodexLoginWithLegacyFlag(apiKey);
+		if (legacyAttempt.result === "success") {
+			console.log("\n✅ Codex CLI login succeeded.");
+			return;
+		}
+		if (legacyAttempt.result === "not-found") {
+			console.log(
+				"\nℹ️  Codex CLI not found on PATH. Skipping codex login step.",
+			);
+			return;
+		}
+		if (legacyAttempt.result === "failed") {
+			const detail = legacyAttempt.message
+				? `: ${legacyAttempt.message}`
+				: ". Try running 'codex login' manually if needed.";
+			console.warn(`\n⚠️  Codex CLI login failed${detail}`);
+		} else {
+			console.warn(
+				"\n⚠️  Codex CLI login failed for an unknown reason. Try running 'codex login' manually if needed.",
+			);
+		}
+		return;
+	}
+
+	if (pipeAttempt.result === "failed") {
+		const detail = pipeAttempt.message
+			? `: ${pipeAttempt.message}`
+			: ". Try running 'codex login --with-api-key' manually if needed.";
+		console.warn(`\n⚠️  Codex CLI login failed${detail}`);
+	} else {
+		console.warn(
+			"\n⚠️  Codex CLI login failed for an unknown reason. Try running 'codex login --with-api-key' manually if needed.",
+		);
+	}
+}
+
+type CodexLoginAttemptResult =
+	| { result: "success" }
+	| { result: "unsupported" }
+	| { result: "not-found" }
+	| { result: "failed"; message?: string };
+
+function attemptCodexLoginWithPipe(
+	apiKey: string,
+): Promise<CodexLoginAttemptResult> {
 	return new Promise((resolve) => {
-		const loginProcess = spawn("codex", ["login", "--api-key", apiKey], {
-			stdio: "inherit",
+		const loginProcess = spawn("codex", ["login", "--with-api-key"], {
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+
+		let stdoutBuffer = "";
+		let stderrBuffer = "";
+
+		loginProcess.stdout?.on("data", (chunk: Buffer) => {
+			const text = chunk.toString();
+			stdoutBuffer += text;
+			process.stdout.write(chunk);
+		});
+
+		loginProcess.stderr?.on("data", (chunk: Buffer) => {
+			const text = chunk.toString();
+			stderrBuffer += text;
+			process.stderr.write(chunk);
 		});
 
 		loginProcess.on("error", (error: NodeJS.ErrnoException) => {
 			if (error.code === "ENOENT") {
-				console.log(
-					"\nℹ️  Codex CLI not found on PATH. Skipping codex login step.",
-				);
-				resolve();
+				resolve({ result: "not-found" });
 				return;
 			}
-			console.warn("\n⚠️  Failed to launch Codex CLI:", error.message);
-			resolve();
+			resolve({ result: "failed", message: error.message });
 		});
 
 		loginProcess.on("close", (code) => {
 			if (code === 0) {
-				console.log("\n✅ Codex CLI login succeeded.");
-			} else if (code !== null) {
-				console.warn(
-					`\n⚠️  Codex CLI exited with code ${code}. Try running 'codex login --api-key <key>' manually if needed.`,
-				);
+				resolve({ result: "success" });
+				return;
 			}
-			resolve();
+
+			const combinedOutput = `${stdoutBuffer}${stderrBuffer}`
+				.trim()
+				.toLowerCase();
+			if (
+				combinedOutput.includes("with-api-key") ||
+				combinedOutput.includes("'--with-api-key'")
+			) {
+				resolve({ result: "unsupported" });
+				return;
+			}
+
+			const failureDetail =
+				combinedOutput || (code !== null ? `exit code ${code}` : undefined);
+			resolve({ result: "failed", message: failureDetail });
+		});
+
+		loginProcess.stdin?.write(`${apiKey}\n`);
+		loginProcess.stdin?.end();
+	});
+}
+
+function attemptCodexLoginWithLegacyFlag(
+	apiKey: string,
+): Promise<CodexLoginAttemptResult> {
+	return new Promise((resolve) => {
+		const loginProcess = spawn("codex", ["login", "--api-key", apiKey], {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+
+		let stdoutBuffer = "";
+		let stderrBuffer = "";
+
+		loginProcess.stdout?.on("data", (chunk: Buffer) => {
+			const text = chunk.toString();
+			stdoutBuffer += text;
+			process.stdout.write(chunk);
+		});
+
+		loginProcess.stderr?.on("data", (chunk: Buffer) => {
+			const text = chunk.toString();
+			stderrBuffer += text;
+			process.stderr.write(chunk);
+		});
+
+		loginProcess.on("error", (error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT") {
+				resolve({ result: "not-found" });
+				return;
+			}
+			resolve({ result: "failed", message: error.message });
+		});
+
+		loginProcess.on("close", (code) => {
+			if (code === 0) {
+				resolve({ result: "success" });
+				return;
+			}
+			const combinedOutput = `${stdoutBuffer}${stderrBuffer}`.trim();
+			const failureDetail =
+				combinedOutput || (code !== null ? `exit code ${code}` : undefined);
+			resolve({ result: "failed", message: failureDetail });
 		});
 	});
 }
@@ -3054,6 +3189,112 @@ async function setDefaultModelCommand() {
 	);
 }
 
+async function setClassifierCommand() {
+	const commandArgs = args.slice(1);
+	const positional = commandArgs.filter((arg) => !arg.startsWith("--"));
+	const runnerArg = positional[0];
+	const modelArg = positional[1] ?? getFlagValue(commandArgs, "model");
+	const clearModel = hasFlag(commandArgs, "clear-model");
+
+	if (!runnerArg || !["claude", "codex"].includes(runnerArg.toLowerCase())) {
+		console.error(
+			"Usage: cyrus set-classifier <claude|codex> [model] [--model=<model>] [--clear-model]",
+		);
+		process.exit(1);
+	}
+
+	const app = new EdgeApp(CYRUS_HOME);
+	const config = app.loadEdgeConfig();
+	ensureCliDefaultsStructure(config);
+	ensureClassifierStructure(config);
+
+	const runner = runnerArg.toLowerCase() as RunnerType;
+	const previous = { ...config.classifier };
+
+	config.classifier!.runner = runner;
+	if (clearModel) {
+		delete config.classifier!.model;
+	} else if (modelArg) {
+		config.classifier!.model = modelArg;
+	}
+
+	app.saveEdgeConfig(config);
+
+	console.log("\n✅ Classifier configuration updated.");
+	console.log(
+		`Previous: runner=${previous.runner ?? "(unset)"} model=${previous.model ?? "(unset)"}`,
+	);
+	console.log(
+		`Current: runner=${config.classifier!.runner} model=${config.classifier!.model ?? "(unset)"}`,
+	);
+	if (config.classifier!.runner === "codex") {
+		console.log(
+			"Ensure Codex CLI is installed and an OpenAI API key is configured (run 'cyrus connect-openai').",
+		);
+	}
+}
+
+async function setProcedureDefaultCommand() {
+	const commandArgs = args.slice(1);
+	const positional = commandArgs.filter((arg) => !arg.startsWith("--"));
+	const procedureName = positional[0];
+	const remove =
+		hasFlag(commandArgs, "remove") || hasFlag(commandArgs, "clear");
+	const runnerArg = positional[1] ?? getFlagValue(commandArgs, "runner");
+	const modelArg = positional[2] ?? getFlagValue(commandArgs, "model");
+
+	if (!procedureName) {
+		console.error(
+			"Usage: cyrus set-procedure-default <procedure> <claude|codex> [model]\n   or: cyrus set-procedure-default <procedure> --remove",
+		);
+		process.exit(1);
+	}
+
+	const app = new EdgeApp(CYRUS_HOME);
+	const config = app.loadEdgeConfig();
+	ensureProcedureDefaultsStructure(config);
+
+	if (remove) {
+		if (config.procedureDefaults && procedureName in config.procedureDefaults) {
+			delete config.procedureDefaults[procedureName];
+			app.saveEdgeConfig(config);
+			console.log(
+				`\n✅ Removed procedure default override for "${procedureName}".`,
+			);
+		} else {
+			console.log(
+				`\nℹ️  No procedure default override set for "${procedureName}".`,
+			);
+		}
+		return;
+	}
+
+	if (!runnerArg || !["claude", "codex"].includes(runnerArg.toLowerCase())) {
+		console.error(
+			"Specify a runner: cyrus set-procedure-default <procedure> <claude|codex> [model]",
+		);
+		process.exit(1);
+	}
+
+	const runner = runnerArg.toLowerCase() as RunnerType;
+	config.procedureDefaults![procedureName] = { runner };
+	if (modelArg) {
+		config.procedureDefaults![procedureName]!.model = modelArg;
+	}
+
+	app.saveEdgeConfig(config);
+
+	console.log("\n✅ Procedure default updated.");
+	console.log(
+		`Procedure "${procedureName}" → runner=${runner} model=${modelArg ?? "(unset)"}`,
+	);
+	if (runner === "codex") {
+		console.log(
+			"Ensure Codex CLI is installed and an OpenAI API key is configured (run 'cyrus connect-openai').",
+		);
+	}
+}
+
 async function migrateConfigCommand() {
 	const commandArgs = args.slice(1);
 	const interactive = hasFlag(commandArgs, "interactive");
@@ -3087,6 +3328,14 @@ async function migrateConfigCommand() {
 
 	ensureCliDefaultsStructure(config);
 	ensureCredentialsStructure(config);
+	if (!config.classifier) {
+		ensureClassifierStructure(config);
+		changes.push("classifier");
+	}
+	if (!config.procedureDefaults) {
+		ensureProcedureDefaultsStructure(config);
+		changes.push("procedureDefaults");
+	}
 
 	if (config.cliDefaults?.claude === undefined) {
 		config.cliDefaults!.claude = {};
@@ -3136,7 +3385,9 @@ async function migrateConfigCommand() {
 	console.log("\n✅ Configuration migrated for multi-CLI support.");
 	console.log(`Backup saved to ${backupPath}`);
 	console.log("Applied updates:");
-	changes.forEach((change) => console.log(`  • ${change}`));
+	changes.forEach((change) => {
+		console.log(`  • ${change}`);
+	});
 }
 
 async function validateCommand() {
@@ -3202,51 +3453,43 @@ async function validateCommand() {
 		}
 
 		if (codexDetected) {
-			const codexAuthArgs = [
-				"exec",
-				"--skip-git-repo-check",
-				"--cd",
-				"/tmp",
-				"echo Codex health check",
-			];
-			const codexAuth = spawnSync("codex", codexAuthArgs, {
+			const codexStatus = spawnSync("codex", ["login", "status"], {
 				encoding: "utf-8",
 			});
-			const combinedOutput = [codexAuth.stdout, codexAuth.stderr]
+			const combinedOutput = [codexStatus.stdout, codexStatus.stderr]
 				.filter(Boolean)
-				.map((text) => text.trim())
-				.filter((text) => text.length > 0)
+				.map((value) => value.trim())
+				.filter((value) => value.length > 0)
 				.join("\n");
-			const unauthorizedPattern =
-				/(401|unauthoriz|invalid (api|token)|forbidden)/i;
-			const trustedDirWarning = /Not inside a trusted directory/i.test(
-				combinedOutput,
-			);
-			const isUnauthorized = unauthorizedPattern.test(combinedOutput);
-			if (codexAuth.error) {
+
+			if (codexStatus.error) {
 				hasErrors = true;
 				console.log(
-					"  ❌ Codex authentication check failed to run:",
-					codexAuth.error.message,
+					"  ❌ Failed to execute 'codex login status':",
+					codexStatus.error.message,
 				);
-			} else if (isUnauthorized) {
+			} else if (codexStatus.status !== 0) {
 				hasErrors = true;
-				console.log(
-					`  ❌ Codex authentication failed${
-						combinedOutput ? `: ${combinedOutput}` : "."
-					}`,
-				);
-			} else if (codexAuth.status === 0 || trustedDirWarning) {
-				console.log("  ✅ Codex authentication verified.");
-				if (trustedDirWarning) {
-					console.log(
-						"    ℹ️  Codex reported 'Not inside a trusted directory', which is expected for this health check.",
-					);
-				}
-			} else {
-				hasErrors = true;
-				const failureDetail = combinedOutput || `exit code ${codexAuth.status}`;
+				const failureDetail =
+					combinedOutput || `exit code ${codexStatus.status}`;
 				console.log(`  ❌ Codex authentication check failed: ${failureDetail}`);
+			} else {
+				const lowerOutput = combinedOutput.toLowerCase();
+				if (
+					lowerOutput.includes("not logged") ||
+					lowerOutput.includes("logged out")
+				) {
+					hasErrors = true;
+					const detail =
+						combinedOutput ||
+						"Codex CLI reported that no account is currently logged in.";
+					console.log(`  ❌ Codex authentication failed: ${detail}`);
+				} else {
+					console.log("  ✅ Codex authentication verified.");
+					if (combinedOutput.length > 0) {
+						console.log(`    ℹ️  ${combinedOutput}`);
+					}
+				}
 			}
 		}
 	} else {
@@ -3315,6 +3558,20 @@ switch (command) {
 		});
 		break;
 
+	case "set-classifier":
+		setClassifierCommand().catch((error) => {
+			console.error("Error:", error);
+			process.exit(1);
+		});
+		break;
+
+	case "set-procedure-default":
+		setProcedureDefaultCommand().catch((error) => {
+			console.error("Error:", error);
+			process.exit(1);
+		});
+		break;
+
 	case "migrate-config":
 		migrateConfigCommand().catch((error) => {
 			console.error("Error:", error);
@@ -3329,15 +3586,15 @@ switch (command) {
 		});
 		break;
 
-	case "set-customer-id":
-		setCustomerIdCommand().catch((error) => {
+	case "prompts":
+		promptsCommand().catch((error) => {
 			console.error("Error:", error);
 			process.exit(1);
 		});
 		break;
 
-	case "prompts":
-		promptsCommand().catch((error) => {
+	case "set-customer-id":
+		setCustomerIdCommand().catch((error) => {
 			console.error("Error:", error);
 			process.exit(1);
 		});
