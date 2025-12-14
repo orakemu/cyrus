@@ -3,8 +3,8 @@
 	"version": "0.0.4",
 	"description": "Simple agent runner for enumerated responses",
 	"type": "module",
-	"main": "dist/index.js",
-	"types": "dist/index.d.ts",
+	"main": "dist/simple-agent-runner/src/index.js",
+	"types": "dist/simple-agent-runner/src/index.d.ts",
 	"files": [
 		"dist"
 	],
