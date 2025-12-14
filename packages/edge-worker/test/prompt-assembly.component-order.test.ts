@@ -45,6 +45,7 @@ describe("Prompt Assembly - Component Order", () => {
 			.expectComponents("issue-context", "user-comment")
 			.expectSystemPrompt(`<task_management_instructions>
 CRITICAL: You MUST use the TodoWrite and TodoRead tools extensively:
+- Do NOT use Linear MCP tools to create comments unless explicitly asked.
 - IMMEDIATELY create a comprehensive task list at the beginning of your work
 - Break down complex tasks into smaller, actionable items
 - Mark tasks as 'in_progress' when you start them
@@ -57,12 +58,17 @@ Remember: Your first message is internal planning. Use this time to:
 1. Thoroughly analyze the issue and requirements
 2. Create detailed todos using TodoWrite
 3. Plan your approach systematically
-</task_management_instructions>`)
+</task_management_instructions>
+`)
 			.expectUserPrompt(`<context>
   <repository>undefined</repository>
   <working_directory>undefined</working_directory>
   <base_branch>undefined</base_branch>
 </context>
+
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
 
 <linear_issue>
   <id>c3d4e5f6-a7b8-9012-cdef-123456789012</id>
@@ -79,6 +85,7 @@ No description provided
 <linear_comments>
 No comments yet.
 </linear_comments>
+
 
 <user_comment>
 Add user authentication

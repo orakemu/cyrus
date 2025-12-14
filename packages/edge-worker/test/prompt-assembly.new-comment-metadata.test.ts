@@ -144,6 +144,10 @@ Focus on addressing the specific request in the mention. You can use the Linear 
   <base_branch>undefined</base_branch>
 </context>
 
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
+
 <linear_issue>
   <id>test-issue-456</id>
   <identifier>TEST-456</identifier>
@@ -160,6 +164,7 @@ Another test description
 No comments yet.
 </linear_comments>
 
+
 <user_comment>
   <author>Bob Jones</author>
   <timestamp>2025-01-27T15:45:00Z</timestamp>
@@ -169,6 +174,7 @@ This is a new comment on the issue
 </user_comment>`)
 			.expectSystemPrompt(`<task_management_instructions>
 CRITICAL: You MUST use the TodoWrite and TodoRead tools extensively:
+- Do NOT use Linear MCP tools to create comments unless explicitly asked.
 - IMMEDIATELY create a comprehensive task list at the beginning of your work
 - Break down complex tasks into smaller, actionable items
 - Mark tasks as 'in_progress' when you start them
@@ -181,7 +187,8 @@ Remember: Your first message is internal planning. Use this time to:
 1. Thoroughly analyze the issue and requirements
 2. Create detailed todos using TodoWrite
 3. Plan your approach systematically
-</task_management_instructions>`)
+</task_management_instructions>
+`)
 			.expectPromptType("fallback")
 			.expectComponents("issue-context", "user-comment")
 			.verify();

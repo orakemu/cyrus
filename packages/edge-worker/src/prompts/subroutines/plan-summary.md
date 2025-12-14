@@ -1,5 +1,7 @@
 # Plan Summary
 
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+
 Present EITHER your clarifying questions OR your implementation plan:
 
 **Format in Linear-compatible markdown:**

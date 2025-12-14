@@ -48,6 +48,7 @@ describe("Prompt Assembly - Subroutines", () => {
 			.expectComponents("issue-context", "subroutine-prompt")
 			.expectSystemPrompt(`<task_management_instructions>
 CRITICAL: You MUST use the TodoWrite and TodoRead tools extensively:
+- Do NOT use Linear MCP tools to create comments unless explicitly asked.
 - IMMEDIATELY create a comprehensive task list at the beginning of your work
 - Break down complex tasks into smaller, actionable items
 - Mark tasks as 'in_progress' when you start them
@@ -60,12 +61,17 @@ Remember: Your first message is internal planning. Use this time to:
 1. Thoroughly analyze the issue and requirements
 2. Create detailed todos using TodoWrite
 3. Plan your approach systematically
-</task_management_instructions>`)
+</task_management_instructions>
+`)
 			.expectUserPrompt(`<context>
   <repository>undefined</repository>
   <working_directory>undefined</working_directory>
   <base_branch>undefined</base_branch>
 </context>
+
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
 
 <linear_issue>
   <id>f1a2b3c4-d5e6-7890-f1a2-b3c4d5e6f789</id>
@@ -83,7 +89,10 @@ Add Stripe integration for payments
 No comments yet.
 </linear_comments>
 
+
 # Implementation Phase
+
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
 
 Implement the requested changes:
 - Write production-ready code
@@ -92,7 +101,8 @@ Implement the requested changes:
 
 **Do NOT**: commit, push, or create PRs (next phase handles that)
 
-Complete with: \`Implementation complete - [what was done].\``)
+Complete with: \`Implementation complete - [what was done].\`
+`)
 			.verify();
 	});
 
@@ -135,6 +145,7 @@ Complete with: \`Implementation complete - [what was done].\``)
 			.expectComponents("issue-context", "subroutine-prompt")
 			.expectSystemPrompt(`<task_management_instructions>
 CRITICAL: You MUST use the TodoWrite and TodoRead tools extensively:
+- Do NOT use Linear MCP tools to create comments unless explicitly asked.
 - IMMEDIATELY create a comprehensive task list at the beginning of your work
 - Break down complex tasks into smaller, actionable items
 - Mark tasks as 'in_progress' when you start them
@@ -147,12 +158,17 @@ Remember: Your first message is internal planning. Use this time to:
 1. Thoroughly analyze the issue and requirements
 2. Create detailed todos using TodoWrite
 3. Plan your approach systematically
-</task_management_instructions>`)
+</task_management_instructions>
+`)
 			.expectUserPrompt(`<context>
   <repository>undefined</repository>
   <working_directory>undefined</working_directory>
   <base_branch>undefined</base_branch>
 </context>
+
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
 
 <linear_issue>
   <id>a1b2c3d4-e5f6-7890-a1b2-c3d4e5f67890</id>
@@ -170,14 +186,18 @@ Can you explain the authentication flow?
 No comments yet.
 </linear_comments>
 
+
 # Investigate Question
+
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
 
 Gather information to answer the question (DON'T answer yet):
 - Search codebase for relevant files/functions
 - Read necessary files
 - Use tools if needed
 
-Complete with: \`Investigation complete - gathered information from [sources].\``)
+Complete with: \`Investigation complete - gathered information from [sources].\`
+`)
 			.verify();
 	});
 
@@ -220,6 +240,7 @@ Complete with: \`Investigation complete - gathered information from [sources].\`
 			.expectComponents("issue-context", "subroutine-prompt")
 			.expectSystemPrompt(`<task_management_instructions>
 CRITICAL: You MUST use the TodoWrite and TodoRead tools extensively:
+- Do NOT use Linear MCP tools to create comments unless explicitly asked.
 - IMMEDIATELY create a comprehensive task list at the beginning of your work
 - Break down complex tasks into smaller, actionable items
 - Mark tasks as 'in_progress' when you start them
@@ -232,12 +253,17 @@ Remember: Your first message is internal planning. Use this time to:
 1. Thoroughly analyze the issue and requirements
 2. Create detailed todos using TodoWrite
 3. Plan your approach systematically
-</task_management_instructions>`)
+</task_management_instructions>
+`)
 			.expectUserPrompt(`<context>
   <repository>undefined</repository>
   <working_directory>undefined</working_directory>
   <base_branch>undefined</base_branch>
 </context>
+
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
 
 <linear_issue>
   <id>b2c3d4e5-f6a7-8901-b2c3-d4e5f6a78901</id>
@@ -255,14 +281,18 @@ Explain the caching implementation
 No comments yet.
 </linear_comments>
 
+
 # Answer Question
+
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
 
 Provide a clear, direct answer using investigation findings:
 - Present in Linear-compatible markdown (supports \`+++collapsible+++\`, @mentions via \`https://linear.app/linear/profiles/username\`)
 - Include code references with line numbers
 - Be complete but concise
 
-Don't mention the investigation process - just answer the question.`)
+Don't mention the investigation process - just answer the question.
+`)
 			.verify();
 	});
 });

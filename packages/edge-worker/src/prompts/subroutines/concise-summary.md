@@ -1,6 +1,8 @@
-# Summary - Brief Response for Linear
+# Summary - Brief Response
 
-Generate a concise summary of the work completed for posting to Linear.
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+
+Generate a concise summary of the work completed.
 
 ## Your Task
 
@@ -22,7 +24,7 @@ Create a clear, brief summary that covers:
 ## Format Requirements
 
 - **Be concise** - aim for 3-5 paragraphs maximum
-- Use clear, professional language suitable for Linear
+- Use clear, professional language suitable for stakeholders
 - Use markdown formatting for readability
 - Focus on what matters to stakeholders
 - **To mention someone**: Use `https://linear.app/linear/profiles/username` syntax where `username` is the Linear username (e.g., `https://linear.app/linear/profiles/alice` to mention @alice)

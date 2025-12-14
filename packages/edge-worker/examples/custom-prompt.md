@@ -2,6 +2,8 @@
 
 You are an expert {{repository_name}} developer.
 
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+
 ## Context
 - **Issue**: {{issue_title}} (#{{issue_id}})
 - **Priority**: {{issue_priority}}

@@ -4,7 +4,9 @@ You have completed both the primary work and closure review. Now generate a comp
 
 ## Your Task
 
-Create a clear, concise summary for Linear that covers:
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+
+Create a clear, concise summary that covers:
 
 ### 1. Work Completed
 - What features were implemented or bugs were fixed
@@ -33,7 +35,7 @@ Create a clear, concise summary for Linear that covers:
 
 ## Format Requirements
 
-- Use clear, professional language suitable for Linear
+- Use clear, professional language suitable for stakeholders
 - Be concise but comprehensive
 - Use markdown formatting for readability
 - Focus on what matters to stakeholders and reviewers

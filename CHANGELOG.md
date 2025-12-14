@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Stopping an in-flight session no longer posts a follow-up error card; the next comment automatically resumes the same Codex context.
 - Recoverable tool and runner errors now appear inline with a ❌ prefix, while only terminal failures surface as Proxy Worker error cards.
+- Prompts now instruct agents not to create Linear comments via Linear MCP tools unless explicitly asked, reducing accidental extra comments during Codex runs.
 
 ### Removed
 - Dropped the `___LAST_MESSAGE_MARKER___` sentinel from all prompts; completion

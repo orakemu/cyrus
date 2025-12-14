@@ -1,5 +1,6 @@
 <task_management_instructions>
 CRITICAL: You MUST use the TodoWrite and TodoRead tools extensively:
+- Do NOT use Linear MCP tools to create comments unless explicitly asked.
 - IMMEDIATELY create a comprehensive task list at the beginning of your work
 - Break down complex tasks into smaller, actionable items
 - Mark tasks as 'in_progress' when you start them

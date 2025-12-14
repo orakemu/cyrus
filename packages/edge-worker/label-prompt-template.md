@@ -3,6 +3,10 @@
 <base_branch>{{base_branch}}</base_branch>
 </git_context>
 
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
+
 <linear_issue>
 <id>{{issue_id}}</id>
 <identifier>{{issue_identifier}}</identifier>

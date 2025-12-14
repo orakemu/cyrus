@@ -44,6 +44,10 @@ describe("Prompt Assembly - New Sessions", () => {
   <base_branch>undefined</base_branch>
 </context>
 
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
+
 <linear_issue>
   <id>a1b2c3d4-e5f6-7890-abcd-ef1234567890</id>
   <identifier>CEE-123</identifier>
@@ -58,9 +62,11 @@ Users cannot log in
 
 <linear_comments>
 No comments yet.
-</linear_comments>`)
+</linear_comments>
+`)
 			.expectSystemPrompt(`<task_management_instructions>
 CRITICAL: You MUST use the TodoWrite and TodoRead tools extensively:
+- Do NOT use Linear MCP tools to create comments unless explicitly asked.
 - IMMEDIATELY create a comprehensive task list at the beginning of your work
 - Break down complex tasks into smaller, actionable items
 - Mark tasks as 'in_progress' when you start them
@@ -73,7 +79,8 @@ Remember: Your first message is internal planning. Use this time to:
 1. Thoroughly analyze the issue and requirements
 2. Create detailed todos using TodoWrite
 3. Plan your approach systematically
-</task_management_instructions>`)
+</task_management_instructions>
+`)
 			.expectPromptType("fallback")
 			.expectComponents("issue-context")
 			.verify();
@@ -115,6 +122,10 @@ Remember: Your first message is internal planning. Use this time to:
   <base_branch>undefined</base_branch>
 </context>
 
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
+
 <linear_issue>
   <id>b2c3d4e5-f6a7-8901-bcde-f12345678901</id>
   <identifier>CEE-456</identifier>
@@ -131,11 +142,13 @@ Add payment processing
 No comments yet.
 </linear_comments>
 
+
 <user_comment>
 Please add Stripe integration
 </user_comment>`)
 			.expectSystemPrompt(`<task_management_instructions>
 CRITICAL: You MUST use the TodoWrite and TodoRead tools extensively:
+- Do NOT use Linear MCP tools to create comments unless explicitly asked.
 - IMMEDIATELY create a comprehensive task list at the beginning of your work
 - Break down complex tasks into smaller, actionable items
 - Mark tasks as 'in_progress' when you start them
@@ -148,7 +161,8 @@ Remember: Your first message is internal planning. Use this time to:
 1. Thoroughly analyze the issue and requirements
 2. Create detailed todos using TodoWrite
 3. Plan your approach systematically
-</task_management_instructions>`)
+</task_management_instructions>
+`)
 			.expectPromptType("fallback")
 			.expectComponents("issue-context", "user-comment")
 			.verify();

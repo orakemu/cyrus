@@ -1,5 +1,7 @@
 # Git & GitHub - Version Control and PR Management
 
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+
 All verification checks have passed. Now commit your changes and create or update the GitHub Pull Request.
 
 ## Your Tasks

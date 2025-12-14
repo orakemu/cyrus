@@ -281,7 +281,18 @@ describe("EdgeWorker runner configuration", () => {
 	});
 
 	describe("validateRunnerAvailability", () => {
-		it("throws when Codex is required but no OpenAI key is configured", () => {
+		it("throws when Codex is required but no auth is configured", () => {
+			(spawnSync as vi.Mock)
+				.mockReturnValueOnce({
+					status: 0,
+					stdout: "codex 1.0.0",
+					stderr: "",
+				})
+				.mockReturnValueOnce({
+					status: 1,
+					stdout: "",
+					stderr: "not logged in",
+				});
 			const repository = clone(baseRepository);
 			const worker = createEdgeWorker({
 				repositories: [repository],
@@ -289,7 +300,7 @@ describe("EdgeWorker runner configuration", () => {
 			});
 
 			expect(() => (worker as any).validateRunnerAvailability()).toThrow(
-				"Codex runner is configured but no OpenAI API key is available",
+				"Codex runner is configured but no authentication is available",
 			);
 		});
 

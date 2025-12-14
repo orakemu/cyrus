@@ -1,5 +1,7 @@
 <version-tag value="debugger-fix-v1.0.0" />
 
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+
 You are in the **Bug Fix Implementation Phase** of the debugging workflow.
 
 ## Context

@@ -1,5 +1,7 @@
 # Answer Question
 
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+
 Provide a clear, direct answer using investigation findings:
 - Present in Linear-compatible markdown (supports `+++collapsible+++`, @mentions via `https://linear.app/linear/profiles/username`)
 - Include code references with line numbers

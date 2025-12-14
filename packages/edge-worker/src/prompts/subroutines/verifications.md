@@ -1,5 +1,7 @@
 # Verifications - Testing and Quality Checks
 
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+
 You have completed the primary work on this issue. Now perform thorough verification to ensure everything works correctly and meets quality standards.
 
 ## Your Tasks

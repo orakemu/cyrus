@@ -1,5 +1,7 @@
 <version-tag value="get-approval-v1.0.0" />
 
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+
 You are in the **Get Approval Phase** of the workflow.
 
 ## Objective

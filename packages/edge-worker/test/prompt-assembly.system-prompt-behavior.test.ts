@@ -43,6 +43,10 @@ describe("Prompt Assembly - System Prompt Behavior", () => {
   <base_branch>undefined</base_branch>
 </context>
 
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
+
 <linear_issue>
   <id>d4e5f6a7-b8c9-0123-def1-234567890123</id>
   <identifier>CEE-1000</identifier>
@@ -57,7 +61,8 @@ Example task
 
 <linear_comments>
 No comments yet.
-</linear_comments>`)
+</linear_comments>
+`)
 			.expectPromptType("fallback")
 			.expectComponents("issue-context")
 			.verify();
@@ -112,6 +117,10 @@ No comments yet.
 <base_branch>undefined</base_branch>
 </git_context>
 
+<linear_comment_policy>
+Do NOT use Linear MCP tools to create comments unless explicitly asked.
+</linear_comment_policy>
+
 <linear_issue>
 <id>e5f6a7b8-c9d0-1234-ef12-345678901234</id>
 <identifier>CEE-2000</identifier>
@@ -132,6 +141,7 @@ No comments yet.
 
 </labels>
 </workspace_context>
+
 
 <user_comment>
 Build the payment integration
