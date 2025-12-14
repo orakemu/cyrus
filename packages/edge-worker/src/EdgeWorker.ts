@@ -3719,7 +3719,10 @@ ${mentionContent}
   </content>
 </mention_comment>
 
-Focus on addressing the specific request in the mention. You can use the Linear MCP tools to fetch additional context if needed.`;
+Focus on addressing the specific request in the mention.
+
+Treat mentions as notifications. Do NOT use Linear MCP tools to create or update Linear comments/issues unless explicitly asked.
+You MAY use Linear MCP tools to fetch additional context if needed.`;
 
 			// Append agent guidance if present
 			prompt += this.formatAgentGuidance(guidance);
