@@ -808,12 +808,6 @@ export class EdgeWorker extends EventEmitter {
 					repository.openaiApiKey.trim().length > 0,
 			);
 
-		if (!hasOpenAiKey) {
-			throw new Error(
-				"Codex runner is configured but no OpenAI API key is available. Set OPENAI_API_KEY or update credentials.openaiApiKey in ~/.cyrus/config.json.",
-			);
-		}
-
 		const result = spawnSync("codex", ["--version"], {
 			encoding: "utf-8",
 		});
@@ -825,6 +819,16 @@ export class EdgeWorker extends EventEmitter {
 				`exit code ${result.status}`;
 			throw new Error(
 				`Codex runner is configured but the Codex CLI is not available (${detail}). Install the Codex CLI or adjust your configuration.`,
+			);
+		}
+
+		const loginStatus = spawnSync("codex", ["login", "status"], {
+			encoding: "utf-8",
+		});
+		const isLoggedIn = !loginStatus.error && loginStatus.status === 0;
+		if (!isLoggedIn && !hasOpenAiKey) {
+			throw new Error(
+				"Codex runner is configured but no authentication is available. Run `codex login` (subscription/OAuth) or set OPENAI_API_KEY / credentials.openaiApiKey in ~/.cyrus/config.json.",
 			);
 		}
 	}
